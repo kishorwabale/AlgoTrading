@@ -163,16 +163,7 @@ def run_screener() -> tuple[list, list]:
 
     df = pd.DataFrame(records)
 
-    # ── Print full top-20 lists (same view as NSE website) ────────────────────
-    top20_g = (df[df["change_pct"] > 0]
-               .sort_values("change_pct", ascending=False)
-               .head(20).to_dict("records"))
-    top20_l = (df[df["change_pct"] < 0]
-               .sort_values("change_pct", ascending=True)
-               .head(20).to_dict("records"))
-
-    _print_list("TOP 20 F&O GAINERS", top20_g)
-    _print_list("TOP 20 F&O LOSERS",  top20_l)
+    print_top20(df)
 
     # ── Apply config filters and pick trading candidates ───────────────────────
     sort_col = "change_pct" if RANK_BY == "pct" else "volume"
@@ -198,3 +189,31 @@ def run_screener() -> tuple[list, list]:
     log.info(f"Gainers selected : {[s['symbol'] for s in gainers]}")
     log.info(f"Losers  selected : {[s['symbol'] for s in losers]}")
     return gainers, losers
+
+
+def print_top20(df: pd.DataFrame) -> None:
+    """Print top 20 gainers and top 20 losers from a quotes DataFrame."""
+    top20_gainers = (
+        df[df["change_pct"] > 0]
+        .sort_values("change_pct", ascending=False)
+        .head(20)
+        .to_dict("records")
+    )
+    top20_losers = (
+        df[df["change_pct"] < 0]
+        .sort_values("change_pct", ascending=True)
+        .head(20)
+        .to_dict("records")
+    )
+
+    _print_list("TOP 20 F&O GAINERS", top20_gainers)
+    _print_list("TOP 20 F&O LOSERS",  top20_losers)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    run_screener()

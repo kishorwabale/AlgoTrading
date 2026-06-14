@@ -1,0 +1,10 @@
+# Secrets
+keys.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files
+scrip_master.csv
