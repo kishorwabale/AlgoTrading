@@ -246,6 +246,9 @@ def run_algo():
         log.info("No stocks passed the filter. No trades placed.")
         return
 
+    log.info(f"Selected gainers to trade: {[s['symbol'] for s in gainers]}")
+    log.info(f"Selected losers to trade : {[s['symbol'] for s in losers]}")
+
     # ── Step 2: Place entries, collect filled positions ────────────────────────
     positions = []
 

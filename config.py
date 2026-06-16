@@ -6,7 +6,7 @@
 # 1. WHEN TO RUN
 # =============================================================================
 # Time of day (24h "HH:MM", local time) at which the algo executes.
-RUN_TIME = "09:20"
+RUN_TIME = "09:18"
 
 # If True  -> main.py sleeps until RUN_TIME, then runs once.
 # If False -> main.py runs immediately (handy for testing).

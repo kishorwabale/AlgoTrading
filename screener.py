@@ -94,8 +94,36 @@ def fetch_quotes(security_ids: list) -> dict:
             timeout=15,
         )
         resp.raise_for_status()
-        data = resp.json().get("data", {}).get("NSE_EQ", {})
-        result.update({str(k): v for k, v in data.items()})
+        raw = resp.json()
+
+        # Diagnose unexpected response shapes
+        top_keys = list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
+        data_val = raw.get("data") if isinstance(raw, dict) else None
+        nse_val  = data_val.get("NSE_EQ") if isinstance(data_val, dict) else data_val
+        nse_type = type(nse_val).__name__
+        nse_len  = len(nse_val) if nse_val is not None else 0
+        log.debug(
+            f"  Batch {i//BATCH+1}: HTTP {resp.status_code} | "
+            f"top-level keys={top_keys} | data type={type(data_val).__name__} | "
+            f"NSE_EQ type={nse_type} len={nse_len}"
+        )
+        if nse_len == 0:
+            log.warning(
+                f"  Batch {i//BATCH+1}: NSE_EQ returned 0 records. "
+                f"Raw response (first 500 chars): {str(raw)[:500]}"
+            )
+
+        data = raw.get("data", {}).get("NSE_EQ", {}) if isinstance(raw.get("data"), dict) else {}
+        if isinstance(data, dict):
+            result.update({str(k): v for k, v in data.items()})
+        elif isinstance(data, list):
+            # Handle list-of-dicts shape: [{security_id, ...}, ...]
+            for item in data:
+                sid = str(item.get("security_id") or item.get("securityId") or "")
+                if sid:
+                    result[sid] = item
+
+    log.info(f"  Quotes fetched: {len(result)} stocks")
     return result
 
 
@@ -142,10 +170,11 @@ def run_screener() -> tuple[list, list]:
 
     records = []
     for sid_str, q in quotes.items():
-        ltp        = float(q.get("last_price")    or q.get("ltp")       or 0)
-        prev_close = float(q.get("close_price")   or q.get("prev_close")
-                           or q.get("close")      or 0)
-        volume     = int(  q.get("volume")        or q.get("total_quantity_traded") or 0)
+        ohlc       = q.get("ohlc") or {}
+        ltp        = float(q.get("last_price")  or q.get("ltp")       or 0)
+        prev_close = float(q.get("close_price") or q.get("prev_close")
+                           or ohlc.get("close") or q.get("close")     or 0)
+        volume     = int(  q.get("volume")      or q.get("total_quantity_traded") or 0)
 
         if prev_close > 0:
             change_pct = round((ltp - prev_close) / prev_close * 100, 2)
