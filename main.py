@@ -231,8 +231,15 @@ def _enter_leg(stock: dict, option_type: str, label: str) -> dict | None:
 
 
 def run_algo():
+    now = datetime.now()
+
+    # NSE is closed on weekends (Saturday=5, Sunday=6)
+    if now.weekday() >= 5:
+        log.info(f"Today is {now.strftime('%A')} — NSE is closed. Exiting.")
+        return
+
     log.info("=" * 65)
-    log.info(f"ALGO TRIGGERED  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"ALGO TRIGGERED  {now.strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 65)
 
     # ── Step 1: Screener ───────────────────────────────────────────────────────
