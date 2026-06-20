@@ -27,6 +27,15 @@ EOD_EXIT_TIME = "15:15"
 SIDE = "both"
 
 # =============================================================================
+# 2B. NIFTY DIRECTION FILTER
+# =============================================================================
+# Compares NIFTY 50 % change at run time against NIFTY_FILTER_PCT.
+#   NIFTY <= -NIFTY_FILTER_PCT  →  skip gainer leg  (market broadly weak)
+#   NIFTY >= +NIFTY_FILTER_PCT  →  skip loser  leg  (market broadly strong)
+# Set to 0.0 to disable the filter and always trade both sides.
+NIFTY_FILTER_PCT = 0.8
+
+# =============================================================================
 # 3. PERCENT FILTER  (floor → ceiling band)
 # =============================================================================
 # Only consider stocks whose absolute % move falls inside [MIN, MAX].
@@ -102,3 +111,23 @@ DRY_RUN = False
 #   → Square off when you are up ₹2,000 OR down ₹2,000 on that leg.
 TARGET_PER_TRADE = 2000   # ₹ profit at which to take the target exit
 SL_PER_TRADE     = 2000   # ₹ loss  at which to cut the stoploss exit
+
+# =============================================================================
+# 9. TRAILING STOP LOSS
+# =============================================================================
+# Protects profit once a position moves in your favour.
+#
+# How it works:
+#   1. P&L >= TRAIL_TRIGGER  → trailing activates for that leg
+#   2. The algo tracks the peak P&L from that point onwards
+#   3. P&L drops below  peak × (TRAIL_LOCK_PCT / 100)  → position exits
+#
+# Example with defaults (TARGET=2000, TRAIL_TRIGGER=1000, TRAIL_LOCK_PCT=50):
+#   P&L reaches ₹1000  → trailing activates
+#   P&L peaks at ₹1500 → TrailSL = ₹1500 × 50% = ₹750
+#   P&L drops to ₹749  → exits locking in ₹749 profit
+#   Without trailing  → position could reverse all the way to -₹2000 SL
+#
+# Set TRAIL_TRIGGER = 0 to disable trailing entirely (plain TARGET/SL only).
+TRAIL_TRIGGER  = 1000   # ₹ profit at which trailing activates
+TRAIL_LOCK_PCT = 50.0   # % of peak P&L protected once trailing is active

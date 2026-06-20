@@ -15,7 +15,10 @@ from datetime import datetime
 from time import sleep
 
 from keys import CLIENT_ID, ACCESS_TOKEN
-from config import TARGET_PER_TRADE, SL_PER_TRADE, PRODUCT_TYPE, ORDER_TAG, DRY_RUN, EOD_EXIT_TIME
+from config import (
+    TARGET_PER_TRADE, SL_PER_TRADE, PRODUCT_TYPE, ORDER_TAG, DRY_RUN,
+    EOD_EXIT_TIME, TRAIL_TRIGGER, TRAIL_LOCK_PCT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -139,9 +142,11 @@ class PositionMonitor:
     """
 
     def __init__(self, positions: list[dict]):
-        self._pos    : dict[str, dict] = {p["security_id"]: dict(p) for p in positions}
-        self._exited : set[str]        = set()
-        self._lock                     = threading.Lock()
+        self._pos          : dict[str, dict]  = {p["security_id"]: dict(p) for p in positions}
+        self._exited       : set[str]         = set()
+        self._lock                            = threading.Lock()
+        self._peak_pnl     : dict[str, float] = {p["security_id"]: 0.0 for p in positions}
+        self._trail_active : set[str]         = set()
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -204,18 +209,49 @@ class PositionMonitor:
             pnl   = round((ltp - entry) * qty, 2)
             sym   = pos.get("trading_symbol", sid)
 
+            # ── Trailing SL logic ──────────────────────────────────────────────
+            with self._lock:
+                if sid in self._exited:
+                    return
+                if pnl > self._peak_pnl[sid]:
+                    self._peak_pnl[sid] = pnl
+                peak            = self._peak_pnl[sid]
+                newly_activated = (
+                    TRAIL_TRIGGER > 0
+                    and pnl >= TRAIL_TRIGGER
+                    and sid not in self._trail_active
+                )
+                if newly_activated:
+                    self._trail_active.add(sid)
+                trail_active    = sid in self._trail_active
+                trail_sl_level  = round(peak * TRAIL_LOCK_PCT / 100, 2) if trail_active else None
+
+            if newly_activated:
+                log.info(
+                    f"  TRAIL ARMED  {sym}  P&L=₹{pnl:+.2f}  "
+                    f"Peak=₹{peak:.2f}  protecting {TRAIL_LOCK_PCT:.0f}% of peak"
+                )
+
+            trail_str = f"  TrailSL=₹{trail_sl_level:>+.2f}" if trail_sl_level is not None else ""
             log.info(
                 f"  TICK  {sym:<30s}  "
                 f"LTP=₹{ltp:>8.2f}  Entry=₹{entry:>8.2f}  "
-                f"P&L=₹{pnl:>+10.2f}"
+                f"P&L=₹{pnl:>+10.2f}{trail_str}"
             )
 
             if pnl >= TARGET_PER_TRADE:
-                log.info(f"  TARGET HIT  {sym}  P&L=₹{pnl:+.2f}  → Exiting")
+                log.info(f"  TARGET HIT    {sym}  P&L=₹{pnl:+.2f}  → Exiting")
                 self._try_exit(sid, pos, "TARGET")
 
+            elif trail_sl_level is not None and pnl < trail_sl_level:
+                log.info(
+                    f"  TRAIL SL HIT  {sym}  P&L=₹{pnl:+.2f}  "
+                    f"TrailSL=₹{trail_sl_level:.2f}  Peak=₹{peak:.2f}  → Exiting"
+                )
+                self._try_exit(sid, pos, "TRAIL_SL")
+
             elif pnl <= -SL_PER_TRADE:
-                log.info(f"  SL HIT      {sym}  P&L=₹{pnl:+.2f}  → Exiting")
+                log.info(f"  SL HIT        {sym}  P&L=₹{pnl:+.2f}  → Exiting")
                 self._try_exit(sid, pos, "STOPLOSS")
 
         except Exception as e:
@@ -244,6 +280,13 @@ class PositionMonitor:
         log.info(f"WebSocket monitor — {len(instruments)} position(s)")
         log.info(f"  Target : ₹{TARGET_PER_TRADE:>8,.0f}  per trade")
         log.info(f"  SL     : ₹{SL_PER_TRADE:>8,.0f}  per trade")
+        if TRAIL_TRIGGER > 0:
+            log.info(
+                f"  Trail  : activates at ₹{TRAIL_TRIGGER:,.0f}  "
+                f"locks {TRAIL_LOCK_PCT:.0f}% of peak"
+            )
+        else:
+            log.info(f"  Trail  : disabled")
         for pos in self._pos.values():
             log.info(
                 f"  Watching: {pos['trading_symbol']:<30s} "

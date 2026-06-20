@@ -20,9 +20,10 @@ from datetime import date, datetime
 from keys import CLIENT_ID, ACCESS_TOKEN
 from config import (
     RUN_TIME, WAIT_FOR_RUN_TIME,
-    SIDE, MIN_PCT_CHANGE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY,
+    SIDE, MIN_PCT_CHANGE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY, NIFTY_FILTER_PCT,
     LOTS, EXPIRY_INDEX, PRODUCT_TYPE, ORDER_TYPE, ORDER_TAG,
     DRY_RUN, TARGET_PER_TRADE, SL_PER_TRADE, MIN_OPTION_OI, LIMIT_PRICE_BUFFER_PCT,
+    TRAIL_TRIGGER, TRAIL_LOCK_PCT,
 )
 from screener import run_screener, load_scrip_master
 from monitor import PositionMonitor, wait_for_fill, fetch_option_ltp, fetch_option_quote
@@ -324,7 +325,7 @@ if __name__ == "__main__":
     log.info("Options Algo starting up…")
     log.info(f"  Mode         : {mode}")
     log.info(f"  Run time     : {RUN_TIME}  (wait={WAIT_FOR_RUN_TIME})")
-    log.info(f"  Side         : {SIDE}")
+    log.info(f"  Side         : {SIDE}  |  NIFTY filter: ±{NIFTY_FILTER_PCT}%")
     log.info(f"  % move band  : {MIN_PCT_CHANGE}% – {MAX_PCT_CHANGE}%")
     log.info(f"  Stocks       : {NUM_GAINERS} gainer(s), {NUM_LOSERS} loser(s)")
     log.info(f"  Rank by      : {RANK_BY}")
@@ -332,6 +333,10 @@ if __name__ == "__main__":
     log.info(f"  Product      : {PRODUCT_TYPE}  |  Order: {ORDER_TYPE}  |  Tag: {ORDER_TAG}")
     log.info(f"  Target       : ₹{TARGET_PER_TRADE:,.0f} per trade")
     log.info(f"  Stop-loss    : ₹{SL_PER_TRADE:,.0f} per trade")
+    if TRAIL_TRIGGER > 0:
+        log.info(f"  Trailing SL  : activates at ₹{TRAIL_TRIGGER:,.0f}  locks {TRAIL_LOCK_PCT:.0f}% of peak")
+    else:
+        log.info(f"  Trailing SL  : disabled")
 
     if WAIT_FOR_RUN_TIME:
         now    = datetime.now()
