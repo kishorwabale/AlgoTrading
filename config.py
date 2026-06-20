@@ -6,11 +6,17 @@
 # 1. WHEN TO RUN
 # =============================================================================
 # Time of day (24h "HH:MM", local time) at which the algo executes.
-RUN_TIME = "09:18"
+RUN_TIME = "09:20"
 
 # If True  -> main.py sleeps until RUN_TIME, then runs once.
+#             If started AFTER RUN_TIME the script will exit without trading.
 # If False -> main.py runs immediately (handy for testing).
 WAIT_FOR_RUN_TIME = True
+
+# Hard exit time for open positions (HH:MM, 24h local).
+# The monitor will force-sell all remaining legs at this time so INTRADAY
+# positions are not left to the broker's auto-square-off at 3:20.
+EOD_EXIT_TIME = "15:15"
 
 # =============================================================================
 # 2. WHICH SIDE OF THE SCREENER
@@ -21,14 +27,13 @@ WAIT_FOR_RUN_TIME = True
 SIDE = "both"
 
 # =============================================================================
-# 3. PERCENT FILTER  (CEILING — maximum move)
+# 3. PERCENT FILTER  (floor → ceiling band)
 # =============================================================================
-# Only consider stocks that have moved AT MOST this % (absolute).
-# The move must be <= the threshold, NOT greater than it.
-#   gainers must have  0 < %chg <=  +MAX_PCT_CHANGE
-#   losers  must have  0 > %chg >= -MAX_PCT_CHANGE
-# Default 2.0 (set to 5.0 to also allow moves up to 5%).
-MAX_PCT_CHANGE = 2.0
+# Only consider stocks whose absolute % move falls inside [MIN, MAX].
+#   gainers:  MIN_PCT_CHANGE <= %chg  <= MAX_PCT_CHANGE
+#   losers :  MIN_PCT_CHANGE <= |%chg| <= MAX_PCT_CHANGE
+MIN_PCT_CHANGE = 1.5   # floor  — ignore moves smaller than this (noise)
+MAX_PCT_CHANGE = 2.0   # ceiling — ignore moves larger than this (already extended)
 
 # =============================================================================
 # 4. HOW MANY STOCKS TO TRADE
@@ -61,11 +66,21 @@ EXPIRY_INDEX = 0
 #   "MARGIN"   -> NRML / carryforward
 PRODUCT_TYPE = "INTRADAY"
 
-# Order type. We place MARKET orders as specified.
-ORDER_TYPE = "MARKET"
+# Order type for entry (exits always use MARKET for speed).
+#   "LIMIT"  -> recommended; price = option LTP × (1 + LIMIT_PRICE_BUFFER_PCT/100)
+#   "MARKET" -> immediate fill but risks wide spread slippage at open
+ORDER_TYPE = "LIMIT"
+
+# How far above the current option LTP to place the buy limit (%).
+# 2 % almost always ensures a fill while capping worst-case slippage.
+LIMIT_PRICE_BUFFER_PCT = 2.0
 
 # Tag attached to every order (shows in the Dhan order book).
 ORDER_TAG = "vol-algo"
+
+# Minimum open interest required on the ATM option contract.
+# Contracts below this threshold are skipped as illiquid.
+MIN_OPTION_OI = 500
 
 # =============================================================================
 # 7. SAFETY SWITCH

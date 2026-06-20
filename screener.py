@@ -10,7 +10,7 @@ import pandas as pd
 from datetime import datetime
 
 from keys import CLIENT_ID, ACCESS_TOKEN
-from config import SIDE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY
+from config import SIDE, MIN_PCT_CHANGE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY
 
 log = logging.getLogger(__name__)
 
@@ -195,25 +195,18 @@ def run_screener() -> tuple[list, list]:
     print_top20(df)
 
     # ── Apply config filters and pick trading candidates ───────────────────────
-    sort_col = "change_pct" if RANK_BY == "pct" else "volume"
-
+    # Within the [MIN, MAX] band, rank by proximity to the ceiling (nearest to MAX_PCT_CHANGE wins).
     gainers, losers = [], []
 
     if SIDE in ("gainers", "both"):
-        gainers = (
-            df[(df["change_pct"] > 0) & (df["change_pct"] <= MAX_PCT_CHANGE)]
-            .sort_values(sort_col, ascending=False)
-            .head(NUM_GAINERS)
-            .to_dict("records")
-        )
+        g = df[(df["change_pct"] >= MIN_PCT_CHANGE) & (df["change_pct"] <= MAX_PCT_CHANGE)].copy()
+        g["dist_to_ceiling"] = (g["change_pct"] - MAX_PCT_CHANGE).abs()
+        gainers = g.sort_values("dist_to_ceiling").head(NUM_GAINERS).to_dict("records")
 
     if SIDE in ("losers", "both"):
-        losers = (
-            df[(df["change_pct"] < 0) & (df["change_pct"] >= -MAX_PCT_CHANGE)]
-            .sort_values(sort_col, ascending=(RANK_BY == "pct"))
-            .head(NUM_LOSERS)
-            .to_dict("records")
-        )
+        lo = df[(df["change_pct"] <= -MIN_PCT_CHANGE) & (df["change_pct"] >= -MAX_PCT_CHANGE)].copy()
+        lo["dist_to_ceiling"] = (lo["change_pct"] + MAX_PCT_CHANGE).abs()
+        losers = lo.sort_values("dist_to_ceiling").head(NUM_LOSERS).to_dict("records")
 
     log.info(f"Gainers selected : {[s['symbol'] for s in gainers]}")
     log.info(f"Losers  selected : {[s['symbol'] for s in losers]}")

@@ -11,10 +11,11 @@ After entry orders are filled:
 import logging
 import threading
 import requests
+from datetime import datetime
 from time import sleep
 
 from keys import CLIENT_ID, ACCESS_TOKEN
-from config import TARGET_PER_TRADE, SL_PER_TRADE, PRODUCT_TYPE, ORDER_TAG, DRY_RUN
+from config import TARGET_PER_TRADE, SL_PER_TRADE, PRODUCT_TYPE, ORDER_TAG, DRY_RUN, EOD_EXIT_TIME
 
 log = logging.getLogger(__name__)
 
@@ -67,9 +68,10 @@ def wait_for_fill(order_id: str) -> float | None:
     return None
 
 
-def fetch_option_ltp(security_id: str) -> float:
+def fetch_option_quote(security_id: str) -> dict:
     """
-    Fetch current LTP of an option contract via REST (used for DRY_RUN entry simulation).
+    Fetch the full market quote for an option contract via REST.
+    Returns the raw quote dict (ltp, open_interest, volume, …).
     """
     resp = requests.post(
         f"{DHAN_BASE}/marketfeed/quote",
@@ -79,9 +81,15 @@ def fetch_option_ltp(security_id: str) -> float:
     )
     resp.raise_for_status()
     data = resp.json().get("data", {}).get("NSE_FNO", {})
-    q    = data.get(str(security_id), {})
-    ltp  = q.get("last_price") or q.get("ltp") or 0
-    return float(ltp)
+    return data.get(str(security_id), {})
+
+
+def fetch_option_ltp(security_id: str) -> float:
+    """
+    Fetch current LTP of an option contract via REST (used for DRY_RUN entry simulation).
+    """
+    q = fetch_option_quote(security_id)
+    return float(q.get("last_price") or q.get("ltp") or 0)
 
 
 # =============================================================================
@@ -254,9 +262,20 @@ class PositionMonitor:
         feed_thread = threading.Thread(target=feed.run_forever, daemon=True)
         feed_thread.start()
 
-        log.info("Live feed running… (Ctrl+C to stop)")
+        _eod = datetime.strptime(EOD_EXIT_TIME, "%H:%M").time()
+        log.info(f"Live feed running… EOD exit at {EOD_EXIT_TIME}  (Ctrl+C to stop)")
         try:
             while not self._all_done():
+                if datetime.now().time() >= _eod:
+                    log.info(
+                        f"EOD exit time {EOD_EXIT_TIME} reached — "
+                        f"force-exiting all remaining positions."
+                    )
+                    with self._lock:
+                        remaining = [sid for sid in self._pos if sid not in self._exited]
+                    for sid in remaining:
+                        self._try_exit(sid, self._pos[sid], "EOD")
+                    break
                 sleep(1)
         except KeyboardInterrupt:
             log.info("Monitor stopped by user (Ctrl+C).")
