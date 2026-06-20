@@ -26,6 +26,10 @@ DHAN_BASE     = "https://api.dhan.co/v2"
 FILL_POLL_SEC = 1    # seconds between order-status polls
 FILL_RETRIES  = 30   # max seconds to wait for a fill confirmation
 
+WS_HEARTBEAT_TIMEOUT = 30   # seconds without any tick → feed considered dead
+WS_RECONNECT_WAIT    = 5    # seconds to wait before each reconnect attempt
+WS_MAX_RECONNECTS    = 5    # give up and alert after this many consecutive failures
+
 
 def _headers() -> dict:
     return {
@@ -142,11 +146,12 @@ class PositionMonitor:
     """
 
     def __init__(self, positions: list[dict]):
-        self._pos          : dict[str, dict]  = {p["security_id"]: dict(p) for p in positions}
-        self._exited       : set[str]         = set()
-        self._lock                            = threading.Lock()
-        self._peak_pnl     : dict[str, float] = {p["security_id"]: 0.0 for p in positions}
-        self._trail_active : set[str]         = set()
+        self._pos            : dict[str, dict]  = {p["security_id"]: dict(p) for p in positions}
+        self._exited         : set[str]         = set()
+        self._lock                              = threading.Lock()
+        self._peak_pnl       : dict[str, float] = {p["security_id"]: 0.0 for p in positions}
+        self._trail_active   : set[str]         = set()
+        self._last_tick_time : datetime         = datetime.now()
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -179,6 +184,9 @@ class PositionMonitor:
         dhanhq v2 passes either (data,) or (instance, data) depending on version.
         We handle both by checking the type of the first argument.
         """
+        # Any message means the connection is alive — update heartbeat
+        self._last_tick_time = datetime.now()
+
         # Normalise: some dhanhq builds pass (instance, dict), others just (dict)
         if not isinstance(data, dict):
             return
@@ -257,6 +265,21 @@ class PositionMonitor:
         except Exception as e:
             log.error(f"  Tick handler error: {e}")
 
+    # ── WebSocket helpers ──────────────────────────────────────────────────────
+
+    def _make_feed(self, marketfeed, instruments) -> threading.Thread:
+        """Create a fresh DhanFeed and return its running daemon thread."""
+        feed = marketfeed.DhanFeed(
+            client_id=CLIENT_ID,
+            access_token=ACCESS_TOKEN,
+            instruments=instruments,
+            subscription_type=marketfeed.Ticker,
+            on_message=self._on_tick,
+        )
+        t = threading.Thread(target=feed.run_forever, daemon=True)
+        t.start()
+        return t
+
     # ── Entry point ────────────────────────────────────────────────────────────
 
     def run(self):
@@ -294,21 +317,16 @@ class PositionMonitor:
             )
         log.info("-" * 65)
 
-        feed = marketfeed.DhanFeed(
-            client_id=CLIENT_ID,
-            access_token=ACCESS_TOKEN,
-            instruments=instruments,
-            subscription_type=marketfeed.Ticker,
-            on_message=self._on_tick,
-        )
-
-        feed_thread = threading.Thread(target=feed.run_forever, daemon=True)
-        feed_thread.start()
-
-        _eod = datetime.strptime(EOD_EXIT_TIME, "%H:%M").time()
+        _eod              = datetime.strptime(EOD_EXIT_TIME, "%H:%M").time()
+        reconnect_count   = 0
+        self._last_tick_time = datetime.now()
+        feed_thread       = self._make_feed(marketfeed, instruments)
         log.info(f"Live feed running… EOD exit at {EOD_EXIT_TIME}  (Ctrl+C to stop)")
+
         try:
             while not self._all_done():
+
+                # ── EOD exit ──────────────────────────────────────────────────
                 if datetime.now().time() >= _eod:
                     log.info(
                         f"EOD exit time {EOD_EXIT_TIME} reached — "
@@ -319,7 +337,32 @@ class PositionMonitor:
                     for sid in remaining:
                         self._try_exit(sid, self._pos[sid], "EOD")
                     break
-                sleep(1)
+
+                # ── Heartbeat / reconnect check ───────────────────────────────
+                elapsed  = (datetime.now() - self._last_tick_time).total_seconds()
+                feed_dead = not feed_thread.is_alive() or elapsed > WS_HEARTBEAT_TIMEOUT
+
+                if feed_dead:
+                    reconnect_count += 1
+                    if reconnect_count > WS_MAX_RECONNECTS:
+                        log.critical(
+                            f"WebSocket failed {WS_MAX_RECONNECTS} reconnect attempts. "
+                            f"Open positions may need MANUAL square-off. Stopping monitor."
+                        )
+                        break
+                    log.warning(
+                        f"WebSocket dead (no tick for {int(elapsed)}s). "
+                        f"Reconnecting ({reconnect_count}/{WS_MAX_RECONNECTS}) "
+                        f"in {WS_RECONNECT_WAIT}s…"
+                    )
+                    sleep(WS_RECONNECT_WAIT)
+                    self._last_tick_time = datetime.now()
+                    feed_thread = self._make_feed(marketfeed, instruments)
+                    log.info("WebSocket reconnected.")
+                else:
+                    reconnect_count = 0   # reset counter on healthy connection
+                    sleep(1)
+
         except KeyboardInterrupt:
             log.info("Monitor stopped by user (Ctrl+C).")
 
