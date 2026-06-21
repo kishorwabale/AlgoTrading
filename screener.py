@@ -10,7 +10,7 @@ import pandas as pd
 from datetime import datetime
 
 from keys import CLIENT_ID, ACCESS_TOKEN
-from config import SIDE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY
+from config import SIDE, MIN_PCT_CHANGE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY, NIFTY_FILTER_PCT
 
 log = logging.getLogger(__name__)
 
@@ -18,6 +18,7 @@ DHAN_BASE           = "https://api.dhan.co/v2"
 SCRIP_MASTER_URL    = "https://images.dhan.co/api-data/api-scrip-master.csv"
 SCRIP_CACHE_FILE    = "scrip_master.csv"
 SCRIP_MAX_AGE_HOURS = 20
+NIFTY_SECURITY_ID   = 13    # NIFTY 50 on NSE_IDX
 
 
 def _headers() -> dict:
@@ -146,6 +147,34 @@ def _print_list(title: str, rows: list):
 
 
 # =============================================================================
+# NIFTY direction
+# =============================================================================
+
+def fetch_nifty_change() -> float | None:
+    """
+    Fetch NIFTY 50 current % change via Dhan market quote API.
+    Returns None if the call fails (filter is skipped on failure).
+    """
+    try:
+        resp = requests.post(
+            f"{DHAN_BASE}/marketfeed/quote",
+            json={"NSE_IDX": [NIFTY_SECURITY_ID]},
+            headers=_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        q = resp.json().get("data", {}).get("NSE_IDX", {}).get(str(NIFTY_SECURITY_ID), {})
+        ltp        = float(q.get("last_price")  or q.get("ltp")       or 0)
+        prev_close = float(q.get("close_price") or q.get("prev_close") or 0)
+        if ltp and prev_close:
+            return round((ltp - prev_close) / prev_close * 100, 2)
+        return float(q.get("change_percentage") or q.get("pChange") or 0) or None
+    except Exception as e:
+        log.warning(f"Could not fetch NIFTY quote: {e}. Direction filter skipped.")
+        return None
+
+
+# =============================================================================
 # Main screener
 # =============================================================================
 
@@ -195,25 +224,40 @@ def run_screener() -> tuple[list, list]:
     print_top20(df)
 
     # ── Apply config filters and pick trading candidates ───────────────────────
-    sort_col = "change_pct" if RANK_BY == "pct" else "volume"
-
+    # Within the [MIN, MAX] band, rank by proximity to the ceiling (nearest to MAX_PCT_CHANGE wins).
     gainers, losers = [], []
 
     if SIDE in ("gainers", "both"):
-        gainers = (
-            df[(df["change_pct"] > 0) & (df["change_pct"] <= MAX_PCT_CHANGE)]
-            .sort_values(sort_col, ascending=False)
-            .head(NUM_GAINERS)
-            .to_dict("records")
-        )
+        g = df[(df["change_pct"] >= MIN_PCT_CHANGE) & (df["change_pct"] <= MAX_PCT_CHANGE)].copy()
+        g["dist_to_ceiling"] = (g["change_pct"] - MAX_PCT_CHANGE).abs()
+        gainers = g.sort_values("dist_to_ceiling").head(NUM_GAINERS).to_dict("records")
 
     if SIDE in ("losers", "both"):
-        losers = (
-            df[(df["change_pct"] < 0) & (df["change_pct"] >= -MAX_PCT_CHANGE)]
-            .sort_values(sort_col, ascending=(RANK_BY == "pct"))
-            .head(NUM_LOSERS)
-            .to_dict("records")
-        )
+        lo = df[(df["change_pct"] <= -MIN_PCT_CHANGE) & (df["change_pct"] >= -MAX_PCT_CHANGE)].copy()
+        lo["dist_to_ceiling"] = (lo["change_pct"] + MAX_PCT_CHANGE).abs()
+        losers = lo.sort_values("dist_to_ceiling").head(NUM_LOSERS).to_dict("records")
+
+    # ── NIFTY direction filter ────────────────────────────────────────────────
+    if NIFTY_FILTER_PCT > 0:
+        nifty_chg = fetch_nifty_change()
+        if nifty_chg is not None:
+            log.info(
+                f"  NIFTY 50 change: {nifty_chg:+.2f}%  "
+                f"checked at {datetime.now().strftime('%H:%M:%S')}  "
+                f"(filter threshold: ±{NIFTY_FILTER_PCT}%)"
+            )
+            if nifty_chg <= -NIFTY_FILTER_PCT and gainers:
+                log.info(
+                    f"  NIFTY strongly DOWN ({nifty_chg:+.2f}%) — "
+                    f"skipping gainer leg: {[s['symbol'] for s in gainers]}"
+                )
+                gainers = []
+            if nifty_chg >= NIFTY_FILTER_PCT and losers:
+                log.info(
+                    f"  NIFTY strongly UP ({nifty_chg:+.2f}%) — "
+                    f"skipping loser leg: {[s['symbol'] for s in losers]}"
+                )
+                losers = []
 
     log.info(f"Gainers selected : {[s['symbol'] for s in gainers]}")
     log.info(f"Losers  selected : {[s['symbol'] for s in losers]}")

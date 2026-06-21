@@ -11,16 +11,24 @@ After entry orders are filled:
 import logging
 import threading
 import requests
+from datetime import datetime
 from time import sleep
 
 from keys import CLIENT_ID, ACCESS_TOKEN
-from config import TARGET_PER_TRADE, SL_PER_TRADE, PRODUCT_TYPE, ORDER_TAG, DRY_RUN
+from config import (
+    TARGET_PER_TRADE, SL_PER_TRADE, PRODUCT_TYPE, ORDER_TAG, DRY_RUN,
+    EOD_EXIT_TIME, TRAIL_TRIGGER, TRAIL_LOCK_PCT,
+)
 
 log = logging.getLogger(__name__)
 
 DHAN_BASE     = "https://api.dhan.co/v2"
 FILL_POLL_SEC = 1    # seconds between order-status polls
 FILL_RETRIES  = 30   # max seconds to wait for a fill confirmation
+
+WS_HEARTBEAT_TIMEOUT = 30   # seconds without any tick → feed considered dead
+WS_RECONNECT_WAIT    = 5    # seconds to wait before each reconnect attempt
+WS_MAX_RECONNECTS    = 5    # give up and alert after this many consecutive failures
 
 
 def _headers() -> dict:
@@ -67,9 +75,10 @@ def wait_for_fill(order_id: str) -> float | None:
     return None
 
 
-def fetch_option_ltp(security_id: str) -> float:
+def fetch_option_quote(security_id: str) -> dict:
     """
-    Fetch current LTP of an option contract via REST (used for DRY_RUN entry simulation).
+    Fetch the full market quote for an option contract via REST.
+    Returns the raw quote dict (ltp, open_interest, volume, …).
     """
     resp = requests.post(
         f"{DHAN_BASE}/marketfeed/quote",
@@ -79,9 +88,15 @@ def fetch_option_ltp(security_id: str) -> float:
     )
     resp.raise_for_status()
     data = resp.json().get("data", {}).get("NSE_FNO", {})
-    q    = data.get(str(security_id), {})
-    ltp  = q.get("last_price") or q.get("ltp") or 0
-    return float(ltp)
+    return data.get(str(security_id), {})
+
+
+def fetch_option_ltp(security_id: str) -> float:
+    """
+    Fetch current LTP of an option contract via REST (used for DRY_RUN entry simulation).
+    """
+    q = fetch_option_quote(security_id)
+    return float(q.get("last_price") or q.get("ltp") or 0)
 
 
 # =============================================================================
@@ -131,9 +146,12 @@ class PositionMonitor:
     """
 
     def __init__(self, positions: list[dict]):
-        self._pos    : dict[str, dict] = {p["security_id"]: dict(p) for p in positions}
-        self._exited : set[str]        = set()
-        self._lock                     = threading.Lock()
+        self._pos            : dict[str, dict]  = {p["security_id"]: dict(p) for p in positions}
+        self._exited         : set[str]         = set()
+        self._lock                              = threading.Lock()
+        self._peak_pnl       : dict[str, float] = {p["security_id"]: 0.0 for p in positions}
+        self._trail_active   : set[str]         = set()
+        self._last_tick_time : datetime         = datetime.now()
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -166,6 +184,9 @@ class PositionMonitor:
         dhanhq v2 passes either (data,) or (instance, data) depending on version.
         We handle both by checking the type of the first argument.
         """
+        # Any message means the connection is alive — update heartbeat
+        self._last_tick_time = datetime.now()
+
         # Normalise: some dhanhq builds pass (instance, dict), others just (dict)
         if not isinstance(data, dict):
             return
@@ -196,22 +217,68 @@ class PositionMonitor:
             pnl   = round((ltp - entry) * qty, 2)
             sym   = pos.get("trading_symbol", sid)
 
+            # ── Trailing SL logic ──────────────────────────────────────────────
+            with self._lock:
+                if sid in self._exited:
+                    return
+                if pnl > self._peak_pnl[sid]:
+                    self._peak_pnl[sid] = pnl
+                peak            = self._peak_pnl[sid]
+                newly_activated = (
+                    TRAIL_TRIGGER > 0
+                    and pnl >= TRAIL_TRIGGER
+                    and sid not in self._trail_active
+                )
+                if newly_activated:
+                    self._trail_active.add(sid)
+                trail_active    = sid in self._trail_active
+                trail_sl_level  = round(peak * TRAIL_LOCK_PCT / 100, 2) if trail_active else None
+
+            if newly_activated:
+                log.info(
+                    f"  TRAIL ARMED  {sym}  P&L=₹{pnl:+.2f}  "
+                    f"Peak=₹{peak:.2f}  protecting {TRAIL_LOCK_PCT:.0f}% of peak"
+                )
+
+            trail_str = f"  TrailSL=₹{trail_sl_level:>+.2f}" if trail_sl_level is not None else ""
             log.info(
                 f"  TICK  {sym:<30s}  "
                 f"LTP=₹{ltp:>8.2f}  Entry=₹{entry:>8.2f}  "
-                f"P&L=₹{pnl:>+10.2f}"
+                f"P&L=₹{pnl:>+10.2f}{trail_str}"
             )
 
             if pnl >= TARGET_PER_TRADE:
-                log.info(f"  TARGET HIT  {sym}  P&L=₹{pnl:+.2f}  → Exiting")
+                log.info(f"  TARGET HIT    {sym}  P&L=₹{pnl:+.2f}  → Exiting")
                 self._try_exit(sid, pos, "TARGET")
 
+            elif trail_sl_level is not None and pnl < trail_sl_level:
+                log.info(
+                    f"  TRAIL SL HIT  {sym}  P&L=₹{pnl:+.2f}  "
+                    f"TrailSL=₹{trail_sl_level:.2f}  Peak=₹{peak:.2f}  → Exiting"
+                )
+                self._try_exit(sid, pos, "TRAIL_SL")
+
             elif pnl <= -SL_PER_TRADE:
-                log.info(f"  SL HIT      {sym}  P&L=₹{pnl:+.2f}  → Exiting")
+                log.info(f"  SL HIT        {sym}  P&L=₹{pnl:+.2f}  → Exiting")
                 self._try_exit(sid, pos, "STOPLOSS")
 
         except Exception as e:
             log.error(f"  Tick handler error: {e}")
+
+    # ── WebSocket helpers ──────────────────────────────────────────────────────
+
+    def _make_feed(self, marketfeed, instruments) -> threading.Thread:
+        """Create a fresh DhanFeed and return its running daemon thread."""
+        feed = marketfeed.DhanFeed(
+            client_id=CLIENT_ID,
+            access_token=ACCESS_TOKEN,
+            instruments=instruments,
+            subscription_type=marketfeed.Ticker,
+            on_message=self._on_tick,
+        )
+        t = threading.Thread(target=feed.run_forever, daemon=True)
+        t.start()
+        return t
 
     # ── Entry point ────────────────────────────────────────────────────────────
 
@@ -236,6 +303,13 @@ class PositionMonitor:
         log.info(f"WebSocket monitor — {len(instruments)} position(s)")
         log.info(f"  Target : ₹{TARGET_PER_TRADE:>8,.0f}  per trade")
         log.info(f"  SL     : ₹{SL_PER_TRADE:>8,.0f}  per trade")
+        if TRAIL_TRIGGER > 0:
+            log.info(
+                f"  Trail  : activates at ₹{TRAIL_TRIGGER:,.0f}  "
+                f"locks {TRAIL_LOCK_PCT:.0f}% of peak"
+            )
+        else:
+            log.info(f"  Trail  : disabled")
         for pos in self._pos.values():
             log.info(
                 f"  Watching: {pos['trading_symbol']:<30s} "
@@ -243,21 +317,52 @@ class PositionMonitor:
             )
         log.info("-" * 65)
 
-        feed = marketfeed.DhanFeed(
-            client_id=CLIENT_ID,
-            access_token=ACCESS_TOKEN,
-            instruments=instruments,
-            subscription_type=marketfeed.Ticker,
-            on_message=self._on_tick,
-        )
+        _eod              = datetime.strptime(EOD_EXIT_TIME, "%H:%M").time()
+        reconnect_count   = 0
+        self._last_tick_time = datetime.now()
+        feed_thread       = self._make_feed(marketfeed, instruments)
+        log.info(f"Live feed running… EOD exit at {EOD_EXIT_TIME}  (Ctrl+C to stop)")
 
-        feed_thread = threading.Thread(target=feed.run_forever, daemon=True)
-        feed_thread.start()
-
-        log.info("Live feed running… (Ctrl+C to stop)")
         try:
             while not self._all_done():
-                sleep(1)
+
+                # ── EOD exit ──────────────────────────────────────────────────
+                if datetime.now().time() >= _eod:
+                    log.info(
+                        f"EOD exit time {EOD_EXIT_TIME} reached — "
+                        f"force-exiting all remaining positions."
+                    )
+                    with self._lock:
+                        remaining = [sid for sid in self._pos if sid not in self._exited]
+                    for sid in remaining:
+                        self._try_exit(sid, self._pos[sid], "EOD")
+                    break
+
+                # ── Heartbeat / reconnect check ───────────────────────────────
+                elapsed  = (datetime.now() - self._last_tick_time).total_seconds()
+                feed_dead = not feed_thread.is_alive() or elapsed > WS_HEARTBEAT_TIMEOUT
+
+                if feed_dead:
+                    reconnect_count += 1
+                    if reconnect_count > WS_MAX_RECONNECTS:
+                        log.critical(
+                            f"WebSocket failed {WS_MAX_RECONNECTS} reconnect attempts. "
+                            f"Open positions may need MANUAL square-off. Stopping monitor."
+                        )
+                        break
+                    log.warning(
+                        f"WebSocket dead (no tick for {int(elapsed)}s). "
+                        f"Reconnecting ({reconnect_count}/{WS_MAX_RECONNECTS}) "
+                        f"in {WS_RECONNECT_WAIT}s…"
+                    )
+                    sleep(WS_RECONNECT_WAIT)
+                    self._last_tick_time = datetime.now()
+                    feed_thread = self._make_feed(marketfeed, instruments)
+                    log.info("WebSocket reconnected.")
+                else:
+                    reconnect_count = 0   # reset counter on healthy connection
+                    sleep(1)
+
         except KeyboardInterrupt:
             log.info("Monitor stopped by user (Ctrl+C).")
 

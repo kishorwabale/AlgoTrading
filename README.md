@@ -1,25 +1,36 @@
 # AlgoTrading — NSE F&O Options Algo
 
 An automated intraday options trading algo built on the [Dhan API](https://dhanhq.co/).  
-It screens all NSE F&O stocks for top movers, buys ATM options, and auto-exits on target or stop-loss.
+It screens all NSE F&O stocks for movers in a tight % band, buys ATM options via limit orders, and auto-exits on target, trailing stop-loss, or end of day.
 
 ## How it works
 
 ```
-09:20 AM  →  Screener ranks all NSE F&O stocks by % change
-          →  Picks top gainers  →  buys ATM CALL (CE)
-          →  Picks top losers   →  buys ATM PUT  (PE)
-          →  WebSocket monitor watches live P&L
-          →  Auto-exits each leg when TARGET or SL is hit
+09:20 AM  →  Screener fetches live quotes for all NSE F&O stocks
+          →  Checks NIFTY 50 % change at exactly 09:20 (timestamped in log)
+               — NIFTY ≤ -0.8%  →  skip gainer leg (market broadly weak)
+               — NIFTY ≥ +0.8%  →  skip loser  leg (market broadly strong)
+          →  Filters stocks whose % move falls in [MIN_PCT_CHANGE, MAX_PCT_CHANGE]
+          →  Selects the stock closest to the ceiling (nearest to ±2%)
+          →  Prints selected GAINER and LOSER to console before any order
+          →  Buys ATM CALL (CE) for gainer, ATM PUT (PE) for loser
+               — skips contracts with OI below MIN_OPTION_OI (liquidity gate)
+               — places LIMIT order at option LTP + LIMIT_PRICE_BUFFER_PCT
+          →  WebSocket monitor watches live P&L per position
+               — auto-reconnects if feed drops (up to 5 attempts, 30s timeout)
+          →  Auto-exits each leg on TARGET / TRAIL_SL / STOPLOSS
+15:15 PM  →  Force-exits any remaining open positions (before broker auto-SQ at 15:20)
 ```
+
+> If the script is started after `RUN_TIME` it exits immediately without placing any orders.
 
 ## Project structure
 
 ```
 AlgoTrading/
 ├── main.py        # Entry point — orchestrates screener → orders → monitor
-├── screener.py    # Fetches live quotes for all NSE FNO stocks, ranks movers
-├── monitor.py     # WebSocket position monitor; auto-exits on TARGET / SL
+├── screener.py    # Fetches live quotes, NIFTY filter, ranks by dist-to-ceiling
+├── monitor.py     # WebSocket monitor with trailing SL, reconnect, EOD exit
 ├── config.py      # All tunable settings (edit this to change strategy)
 └── keys.py        # API credentials — NOT committed (gitignored)
 ```
@@ -47,21 +58,48 @@ Get your credentials from the [Dhan developer portal](https://developer.dhan.co/
 
 Open [config.py](config.py) and adjust the settings:
 
+#### Timing
+
 | Setting | Default | Description |
 |---|---|---|
-| `RUN_TIME` | `"09:20"` | Time to run (24h, local time) |
-| `WAIT_FOR_RUN_TIME` | `True` | Sleep until run time; `False` to run immediately |
+| `RUN_TIME` | `"09:20"` | Time to run (24h, local). Script exits without trading if started after this. |
+| `WAIT_FOR_RUN_TIME` | `True` | Sleep until `RUN_TIME`; set `False` to run immediately (testing only) |
+| `EOD_EXIT_TIME` | `"15:15"` | Force-exit all open positions at this time to avoid broker auto-square-off |
+
+#### Stock selection
+
+| Setting | Default | Description |
+|---|---|---|
 | `SIDE` | `"both"` | `"gainers"`, `"losers"`, or `"both"` |
-| `MAX_PCT_CHANGE` | `2.0` | Max % move allowed (ceiling filter) |
+| `NIFTY_FILTER_PCT` | `0.8` | Skip gainer leg if NIFTY ≤ −0.8%; skip loser leg if NIFTY ≥ +0.8%. Set `0` to disable. |
+| `MIN_PCT_CHANGE` | `1.5` | Floor — stocks that moved less than this % are ignored |
+| `MAX_PCT_CHANGE` | `2.0` | Ceiling — stocks that moved more than this % are ignored |
 | `NUM_GAINERS` | `1` | How many gainer stocks to trade |
 | `NUM_LOSERS` | `1` | How many loser stocks to trade |
-| `RANK_BY` | `"pct"` | Rank by `"pct"` (biggest mover) or `"volume"` |
+
+> Within the `[MIN, MAX]` band, the stock whose % change is **closest to the ceiling** is selected.  
+> Example: with band 1.5–2%, a stock at 1.98% is preferred over one at 1.7%.
+
+#### Order settings
+
+| Setting | Default | Description |
+|---|---|---|
 | `LOTS` | `1` | Lots per trade |
 | `EXPIRY_INDEX` | `0` | `0` = nearest expiry, `1` = next, etc. |
 | `PRODUCT_TYPE` | `"INTRADAY"` | `"INTRADAY"` (MIS) or `"MARGIN"` (NRML) |
+| `ORDER_TYPE` | `"LIMIT"` | `"LIMIT"` recommended; `"MARKET"` risks wide spread at open |
+| `LIMIT_PRICE_BUFFER_PCT` | `2.0` | Limit price = option LTP × (1 + this %). Ensures fill while capping slippage. |
+| `MIN_OPTION_OI` | `500` | Minimum open interest on the ATM contract. Skips illiquid options. |
+
+#### Risk
+
+| Setting | Default | Description |
+|---|---|---|
 | `TARGET_PER_TRADE` | `2000` | Exit when profit reaches ₹ this amount |
 | `SL_PER_TRADE` | `2000` | Exit when loss reaches ₹ this amount |
-| `DRY_RUN` | `False` | `True` = simulate only, no real orders |
+| `TRAIL_TRIGGER` | `1000` | ₹ profit at which trailing stop activates. Set `0` to disable. |
+| `TRAIL_LOCK_PCT` | `50.0` | % of peak profit protected once trailing is active |
+| `DRY_RUN` | `False` | `True` = simulate only, no real orders placed |
 
 ### 4. Run
 
@@ -70,6 +108,44 @@ python main.py
 ```
 
 Stop at any time with `Ctrl+C`.
+
+## Console output before orders
+
+After the screener runs, the algo prints the selected stocks clearly before placing any order:
+
+```
+=================================================================
+  STOCKS SELECTED FOR TRADING
+=================================================================
+  GAINER  PREMIERENE       +1.98%  LTP ₹312.50
+  LOSER   GMRAIRPORT       -1.85%  LTP ₹87.30
+=================================================================
+```
+
+## Trailing stop-loss
+
+Once a position's profit reaches `TRAIL_TRIGGER`, the trailing SL activates and tracks the peak P&L. The position exits if P&L drops below `peak × (TRAIL_LOCK_PCT / 100)`.
+
+| Scenario | Exit reason | Outcome |
+|---|---|---|
+| P&L hits ₹2000 directly | TARGET | +₹2000 profit |
+| Peaks at ₹1500, then reverses | TRAIL_SL | +₹750 locked in |
+| Never reaches ₹1000 trigger | STOPLOSS | −₹2000 loss |
+
+The plain SL (`-SL_PER_TRADE`) remains the backstop if trailing never activates.
+
+## WebSocket reconnect
+
+The monitor detects a dead feed in two ways:
+- The feed thread exits unexpectedly
+- No tick received for `30` seconds (heartbeat timeout)
+
+On detection it waits `5` seconds and reconnects automatically, up to `5` consecutive attempts. If all attempts fail, a `CRITICAL` log is printed and the monitor stops — open positions will need **manual square-off** on Dhan.
+
+```
+WARNING:  WebSocket dead (no tick for 30s). Reconnecting (1/5) in 5s…
+INFO:     WebSocket reconnected.
+```
 
 ## Running the screener standalone
 

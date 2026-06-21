@@ -20,12 +20,13 @@ from datetime import date, datetime
 from keys import CLIENT_ID, ACCESS_TOKEN
 from config import (
     RUN_TIME, WAIT_FOR_RUN_TIME,
-    SIDE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY,
+    SIDE, MIN_PCT_CHANGE, MAX_PCT_CHANGE, NUM_GAINERS, NUM_LOSERS, RANK_BY, NIFTY_FILTER_PCT,
     LOTS, EXPIRY_INDEX, PRODUCT_TYPE, ORDER_TYPE, ORDER_TAG,
-    DRY_RUN, TARGET_PER_TRADE, SL_PER_TRADE,
+    DRY_RUN, TARGET_PER_TRADE, SL_PER_TRADE, MIN_OPTION_OI, LIMIT_PRICE_BUFFER_PCT,
+    TRAIL_TRIGGER, TRAIL_LOCK_PCT,
 )
 from screener import run_screener, load_scrip_master
-from monitor import PositionMonitor, wait_for_fill, fetch_option_ltp
+from monitor import PositionMonitor, wait_for_fill, fetch_option_ltp, fetch_option_quote
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,8 +124,20 @@ def find_option_contract(symbol: str, ltp: float, option_type: str) -> dict | No
     chain["dist"] = (chain["SEM_STRIKE_PRICE"] - ltp).abs()
     atm = chain.loc[chain["dist"].idxmin()]
 
+    security_id = str(int(atm["SEM_SMST_SECURITY_ID"]))
+
+    # Liquidity gate — skip if open interest is too thin
+    quote = fetch_option_quote(security_id)
+    oi = int(quote.get("open_interest") or quote.get("oi") or 0)
+    if oi < MIN_OPTION_OI:
+        log.warning(
+            f"  ATM {option_type} {atm['SEM_TRADING_SYMBOL']} "
+            f"OI={oi:,} < MIN_OPTION_OI={MIN_OPTION_OI:,}. Skipping."
+        )
+        return None
+
     return {
-        "security_id":    str(int(atm["SEM_SMST_SECURITY_ID"])),
+        "security_id":    security_id,
         "lot_size":       int(atm["SEM_LOT_UNITS"]),
         "expiry":         str(chosen_expiry),
         "strike":         float(atm["SEM_STRIKE_PRICE"]),
@@ -137,19 +150,23 @@ def find_option_contract(symbol: str, ltp: float, option_type: str) -> dict | No
 # Order placement
 # =============================================================================
 
-def place_order(contract: dict, transaction_type: str = "BUY") -> dict:
+def place_order(contract: dict, transaction_type: str = "BUY", option_ltp: float = 0) -> dict:
     """
-    Place a market order on Dhan. Logs only when DRY_RUN=True.
+    Place an entry order on Dhan. Uses LIMIT price when ORDER_TYPE="LIMIT".
+    Logs only (no real order) when DRY_RUN=True.
     """
-    quantity = contract["lot_size"] * LOTS
-    prefix   = "[DRY RUN] " if DRY_RUN else ""
+    quantity    = contract["lot_size"] * LOTS
+    limit_price = (round(option_ltp * (1 + LIMIT_PRICE_BUFFER_PCT / 100), 1)
+                   if ORDER_TYPE == "LIMIT" and option_ltp else 0)
+    price_str   = f"₹{limit_price:.1f}" if limit_price else "MARKET"
+    prefix      = "[DRY RUN] " if DRY_RUN else ""
 
     log.info(
         f"  {prefix}ORDER → {transaction_type} {contract['trading_symbol']} "
         f"| Strike {contract['strike']} {contract['option_type']} "
         f"| Expiry {contract['expiry']} "
         f"| Qty {quantity}  ({LOTS} lot × {contract['lot_size']}) "
-        f"| Tag: {ORDER_TAG}"
+        f"| {ORDER_TYPE} @ {price_str}  | Tag: {ORDER_TAG}"
     )
 
     if DRY_RUN:
@@ -166,7 +183,7 @@ def place_order(contract: dict, transaction_type: str = "BUY") -> dict:
         "tradingSymbol":     contract["trading_symbol"],
         "securityId":        contract["security_id"],
         "quantity":          quantity,
-        "price":             0,
+        "price":             limit_price,
         "disclosedQuantity": 0,
         "afterMarketOrder":  False,
         "amoTime":           "OPEN",
@@ -195,8 +212,11 @@ def _enter_leg(stock: dict, option_type: str, label: str) -> dict | None:
         log.warning(f"  No ATM {option_type} found for {stock['symbol']}. Skipping.")
         return None
 
+    # Fetch option LTP once — used for LIMIT price calculation and DRY_RUN simulation
+    option_ltp = fetch_option_ltp(contract["security_id"]) or 0
+
     try:
-        result = place_order(contract, "BUY")
+        result = place_order(contract, "BUY", option_ltp)
     except requests.HTTPError as e:
         log.error(f"  Order failed: {e.response.text if e.response else e}")
         return None
@@ -206,9 +226,9 @@ def _enter_leg(stock: dict, option_type: str, label: str) -> dict | None:
 
     quantity = contract["lot_size"] * LOTS
 
-    # Get entry price: poll fill for live orders, REST quote for dry-run simulation
+    # Get entry price: use fetched LTP for dry-run, poll fill for live orders
     if DRY_RUN:
-        entry_price = fetch_option_ltp(contract["security_id"]) or stock["ltp"]
+        entry_price = option_ltp or stock["ltp"]
         log.info(f"  [DRY RUN] Simulated entry price: ₹{entry_price:.2f}")
     else:
         order_id    = (result.get("orderId")
@@ -253,8 +273,23 @@ def run_algo():
         log.info("No stocks passed the filter. No trades placed.")
         return
 
-    log.info(f"Selected gainers to trade: {[s['symbol'] for s in gainers]}")
-    log.info(f"Selected losers to trade : {[s['symbol'] for s in losers]}")
+    # ── Print selected stocks clearly before any order is placed ─────────────
+    print()
+    print("=" * 65)
+    print("  STOCKS SELECTED FOR TRADING")
+    print("=" * 65)
+    if gainers:
+        for s in gainers:
+            print(f"  GAINER  {s['symbol']:<15}  {s['change_pct']:+.2f}%  LTP ₹{s['ltp']:.2f}")
+    else:
+        print("  GAINER  —  none qualified")
+    if losers:
+        for s in losers:
+            print(f"  LOSER   {s['symbol']:<15}  {s['change_pct']:+.2f}%  LTP ₹{s['ltp']:.2f}")
+    else:
+        print("  LOSER   —  none qualified")
+    print("=" * 65)
+    print()
 
     # ── Step 2: Place entries, collect filled positions ────────────────────────
     positions = []
@@ -290,14 +325,18 @@ if __name__ == "__main__":
     log.info("Options Algo starting up…")
     log.info(f"  Mode         : {mode}")
     log.info(f"  Run time     : {RUN_TIME}  (wait={WAIT_FOR_RUN_TIME})")
-    log.info(f"  Side         : {SIDE}")
-    log.info(f"  Max % move   : {MAX_PCT_CHANGE}% ceiling")
+    log.info(f"  Side         : {SIDE}  |  NIFTY filter: ±{NIFTY_FILTER_PCT}%")
+    log.info(f"  % move band  : {MIN_PCT_CHANGE}% – {MAX_PCT_CHANGE}%")
     log.info(f"  Stocks       : {NUM_GAINERS} gainer(s), {NUM_LOSERS} loser(s)")
     log.info(f"  Rank by      : {RANK_BY}")
     log.info(f"  Lots         : {LOTS}  |  Expiry index: {EXPIRY_INDEX}")
     log.info(f"  Product      : {PRODUCT_TYPE}  |  Order: {ORDER_TYPE}  |  Tag: {ORDER_TAG}")
     log.info(f"  Target       : ₹{TARGET_PER_TRADE:,.0f} per trade")
     log.info(f"  Stop-loss    : ₹{SL_PER_TRADE:,.0f} per trade")
+    if TRAIL_TRIGGER > 0:
+        log.info(f"  Trailing SL  : activates at ₹{TRAIL_TRIGGER:,.0f}  locks {TRAIL_LOCK_PCT:.0f}% of peak")
+    else:
+        log.info(f"  Trailing SL  : disabled")
 
     if WAIT_FOR_RUN_TIME:
         now    = datetime.now()
@@ -310,9 +349,12 @@ if __name__ == "__main__":
             wait_sec = int((run_at - now).total_seconds())
             log.info(f"Sleeping {wait_sec // 60}m {wait_sec % 60}s until {RUN_TIME}…  (Ctrl+C to abort)")
             time.sleep(wait_sec)
+            run_algo()
         else:
-            log.info(f"{RUN_TIME} already passed today — running immediately.")
+            log.warning(
+                f"{RUN_TIME} already passed (current time {now.strftime('%H:%M')}) — "
+                f"started too late. Exiting without trading."
+            )
     else:
         log.info("WAIT_FOR_RUN_TIME=False — running immediately.")
-
-    run_algo()
+        run_algo()
