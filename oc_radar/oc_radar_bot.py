@@ -174,7 +174,23 @@ def generate_token_with_totp(totp_code):
             DHAN_API_KEY          = token
             token_generated_today = True
             waiting_for_totp      = False
-            expiry = data.get("expiryTime", "24 hours")
+            # Format expiry date nicely
+            expiry_raw = data.get("expiryTime", "")
+            try:
+                # Convert "2026-06-28T01:46:54.423" to "28th Jun 2026 01:46 AM"
+                exp_dt  = datetime.strptime(expiry_raw[:19], "%Y-%m-%dT%H:%M:%S")
+                day     = exp_dt.day
+                suffix  = ("st" if day in [1,21,31] else
+                           "nd" if day in [2,22] else
+                           "rd" if day in [3,23] else "th")
+                months  = ["Jan","Feb","Mar","Apr","May","Jun",
+                           "Jul","Aug","Sep","Oct","Nov","Dec"]
+                h       = exp_dt.hour
+                hh      = str(h%12 or 12).zfill(2)
+                ampm    = "AM" if h < 12 else "PM"
+                expiry  = f"{day}{suffix} {months[exp_dt.month-1]} {exp_dt.year} {hh}:{str(exp_dt.minute).zfill(2)} {ampm} IST"
+            except:
+                expiry = expiry_raw or "24 hours"
             send_telegram(
                 f"✅ *Token auto-generated!*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
