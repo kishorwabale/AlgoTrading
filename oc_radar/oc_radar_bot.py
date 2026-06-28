@@ -5,6 +5,7 @@
 # Zero manual work every morning! 🎉
 # SECURE: All secrets loaded from ~/.env file
 #         Never hardcoded in script!
+# AUTO-LOGGING: Signals + Trades → Google Sheets
 # ══════════════════════════════════════════════════════════════
 
 import requests
@@ -14,12 +15,13 @@ import hashlib
 import struct
 import base64
 import os
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime, time as dtime, timedelta
 import pytz
 
 # ── LOAD SECRETS FROM ~/.env FILE ────────────────────────────
-# Secrets are stored in ~/.env — NOT in this script!
-# This script is safe to share/push to GitHub
 def load_env(filepath="~/.env"):
     """Load environment variables from ~/.env file"""
     filepath = os.path.expanduser(filepath)
@@ -39,12 +41,240 @@ def load_env(filepath="~/.env"):
 load_env()
 
 # ── CONFIGURATION — loaded from environment ───────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DHAN_CLIENT_ID   = os.getenv("DHAN_CLIENT_ID",   "1111888014")
-DHAN_API_KEY     = ""  # Auto-filled every morning!
-DHAN_PIN         = os.getenv("DHAN_PIN",         "")
-DHAN_TOTP_SECRET = os.getenv("DHAN_TOTP_SECRET", "")
+TELEGRAM_TOKEN        = os.getenv("TELEGRAM_TOKEN",            "")
+TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID",          "")
+DHAN_CLIENT_ID        = os.getenv("DHAN_CLIENT_ID",            "1111888014")
+DHAN_API_KEY          = ""  # Auto-filled every morning!
+DHAN_PIN              = os.getenv("DHAN_PIN",                  "")
+DHAN_TOTP_SECRET      = os.getenv("DHAN_TOTP_SECRET",          "")
+GOOGLE_SHEET_ID       = os.getenv("GOOGLE_SHEET_ID",           "")
+GOOGLE_CREDENTIALS    = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "")
+
+# ══════════════════════════════════════════════════════════════
+# GOOGLE SHEETS AUTO-LOGGING
+# ══════════════════════════════════════════════════════════════
+_gsheet_client  = None
+_signal_sheet   = None
+_trade_sheet    = None
+_pnl_sheet      = None
+
+def init_google_sheets():
+    """Initialize Google Sheets connection"""
+    global _gsheet_client, _signal_sheet, _trade_sheet, _pnl_sheet
+
+    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS:
+        print("⚠️ Google Sheets not configured — skipping auto-logging")
+        return False
+
+    try:
+        # Parse credentials from env
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scopes = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds          = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        _gsheet_client = gspread.authorize(creds)
+        wb             = _gsheet_client.open_by_key(GOOGLE_SHEET_ID)
+
+        # Get sheets by name — create if missing
+        sheet_names = [s.title for s in wb.worksheets()]
+
+        def get_or_create(name, headers):
+            if name not in sheet_names:
+                ws = wb.add_worksheet(title=name, rows=500, cols=len(headers))
+                ws.append_row(headers)
+                return ws
+            return wb.worksheet(name)
+
+        _signal_sheet = get_or_create("⏱ Signal Log", [
+            "Date", "Ping Time IST", "Response Time IST", "Index",
+            "Signal (CE/PE)", "Strike", "Score", "OICR (%)", "PCR",
+            "OI Pattern", "VIX", "Futures Basis", "Composite Score",
+            "Action", "Window", "Notes"
+        ])
+
+        _trade_sheet = get_or_create("📓 Trade Journal", [
+            "Date", "Day", "Index", "CE/PE", "Strike",
+            "Entry Time", "Entry Price", "Lots", "Capital Used",
+            "Exit Time", "Exit Price", "P&L (₹)", "P&L (%)",
+            "Hold Time (min)", "Score", "OICR", "Pattern",
+            "Result", "Order ID", "Notes"
+        ])
+
+        _pnl_sheet = get_or_create("💰 Daily P&L", [
+            "Date", "Day", "Signals Received", "Trades Taken",
+            "Winners", "Losers", "Win Rate (%)", "Gross P&L (₹)",
+            "Brokerage (₹)", "Net P&L (₹)", "Notes"
+        ])
+
+        print("✅ Google Sheets connected!")
+        return True
+
+    except Exception as e:
+        print(f"⚠️ Google Sheets init error: {e}")
+        return False
+
+def log_signal_to_sheet(name, sig, ping_time, resp_time, window, pcr_trends):
+    """Auto-log every signal to Google Sheets Signal Log"""
+    global _signal_sheet
+    if not _signal_sheet:
+        return
+
+    try:
+        now     = datetime.now(IST)
+        date    = now.strftime("%d-%b-%Y")
+        pcr_trend = pcr_trends.get(name, ("", ""))[0] if pcr_trends else ""
+
+        row = [
+            date,
+            ping_time,
+            resp_time,
+            name,
+            sig.get("action", ""),
+            sig.get("ce_strike", "") if "CE" in sig.get("action","") else sig.get("pe_strike",""),
+            max(sig.get("ce_score", 0), sig.get("pe_score", 0)),
+            sig.get("oicr", ""),
+            sig.get("pcr", ""),
+            "",  # OI Pattern — from buildups
+            "",  # VIX
+            "",  # Futures Basis
+            "",  # Composite
+            sig.get("action", ""),
+            window,
+            sig.get("mkt", ""),
+        ]
+        _signal_sheet.append_row(row)
+        print(f"  📊 Signal logged to Sheets: {name} {sig.get('action','')}")
+
+    except Exception as e:
+        print(f"  ⚠️ Signal sheet log error: {e}")
+
+def log_trade_to_sheet(name, side, strike, entry_price, lots,
+                        exit_price, entry_time, exit_time,
+                        score, oicr, pattern, order_id=""):
+    """Auto-log trade to Google Sheets Trade Journal"""
+    global _trade_sheet
+    if not _trade_sheet:
+        return
+
+    try:
+        now      = datetime.now(IST)
+        date     = now.strftime("%d-%b-%Y")
+        day      = now.strftime("%a")
+        lot_size = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20}.get(name, 30)
+        capital  = round(entry_price * lots * lot_size)
+        pnl_rs   = round((exit_price - entry_price) * lots * lot_size, 2)
+        pnl_pct  = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price else 0
+
+        # Hold time in minutes
+        try:
+            entry_dt = datetime.strptime(entry_time, "%I:%M:%S %p")
+            exit_dt  = datetime.strptime(exit_time, "%I:%M:%S %p")
+            hold_min = round((exit_dt - entry_dt).seconds / 60, 1)
+        except:
+            hold_min = ""
+
+        result = "WIN ✅" if pnl_rs > 0 else "LOSS ❌"
+
+        row = [
+            date, day, name, side, strike,
+            entry_time, entry_price, lots, capital,
+            exit_time, exit_price, pnl_rs, f"{pnl_pct}%",
+            hold_min, score, oicr, pattern,
+            result, order_id, ""
+        ]
+        _trade_sheet.append_row(row)
+        print(f"  📊 Trade logged to Sheets: {name} {side} {result}")
+
+    except Exception as e:
+        print(f"  ⚠️ Trade sheet log error: {e}")
+
+def log_eod_pnl_to_sheet(results, daily_signals, daily_trades):
+    """Auto-log daily P&L summary to Google Sheets"""
+    global _pnl_sheet
+    if not _pnl_sheet:
+        return
+
+    try:
+        now     = datetime.now(IST)
+        date    = now.strftime("%d-%b-%Y")
+        day     = now.strftime("%a")
+
+        # Calculate totals
+        winners   = sum(1 for t in daily_trades if t.get("pnl", 0) > 0)
+        losers    = sum(1 for t in daily_trades if t.get("pnl", 0) <= 0)
+        trades    = len(daily_trades)
+        win_rate  = round(winners / trades * 100, 1) if trades else 0
+        gross_pnl = sum(t.get("pnl", 0) for t in daily_trades)
+        brokerage = trades * 70  # ₹70 per trade
+        net_pnl   = gross_pnl - brokerage
+
+        row = [
+            date, day, daily_signals, trades,
+            winners, losers, f"{win_rate}%",
+            gross_pnl, brokerage, net_pnl, ""
+        ]
+        _pnl_sheet.append_row(row)
+        print(f"  📊 EOD P&L logged to Sheets: Net ₹{net_pnl}")
+
+    except Exception as e:
+        print(f"  ⚠️ P&L sheet log error: {e}")
+
+def auto_import_trades_from_dhan():
+    """
+    Fetch today's executed trades from Dhan API
+    Auto-log to Google Sheets Trade Journal
+    """
+    global _trade_sheet
+    if not _trade_sheet or not DHAN_API_KEY:
+        return []
+
+    try:
+        url = "https://api.dhan.co/v2/trades"
+        headers = {
+            "access-token": DHAN_API_KEY,
+            "client-id": DHAN_CLIENT_ID,
+        }
+        r     = requests.get(url, headers=headers, timeout=10)
+        data  = r.json()
+        trades = data.get("data", [])
+
+        imported = []
+        for t in trades:
+            # Only process F&O trades
+            seg = t.get("exchangeSegment", "")
+            if "FNO" not in seg:
+                continue
+
+            symbol    = t.get("tradingSymbol", "")
+            side      = t.get("transactionType", "")
+            qty       = t.get("tradedQuantity", 0)
+            price     = t.get("tradedPrice", 0)
+            order_id  = t.get("orderId", "")
+            trade_time= t.get("updateTime", "")
+
+            imported.append({
+                "symbol":   symbol,
+                "side":     side,
+                "qty":      qty,
+                "price":    price,
+                "order_id": order_id,
+                "time":     trade_time,
+            })
+
+        if imported:
+            print(f"  📥 Imported {len(imported)} trades from Dhan")
+            send_telegram(
+                f"📥 *{len(imported)} trades auto-imported from Dhan*\n"
+                f"Check Google Sheets Trade Journal ✅"
+            )
+
+        return imported
+
+    except Exception as e:
+        print(f"  ⚠️ Dhan trade import error: {e}")
+        return []
 
 # ── VALIDATE SECRETS ─────────────────────────────────────────
 def validate_secrets():
@@ -56,8 +286,10 @@ def validate_secrets():
     if not DHAN_TOTP_SECRET: missing.append("DHAN_TOTP_SECRET")
     if missing:
         print(f"❌ Missing secrets in ~/.env: {', '.join(missing)}")
-        print("Add them to ~/.env and restart bot")
         return False
+    # Google Sheets optional warning
+    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS:
+        print("⚠️ Google Sheets not configured — signals won't auto-log")
     print("✅ All secrets loaded from ~/.env")
     return True
 
@@ -1702,6 +1934,17 @@ def main():
     exit_all_sent        = False
     closing_alert_sent   = False
     results              = {}
+    daily_signals_count  = 0   # Track signals sent today
+    daily_trades         = []  # Track trades for EOD log
+
+    # Initialize Google Sheets
+    print("📊 Connecting to Google Sheets...")
+    sheets_ok = init_google_sheets()
+    if sheets_ok:
+        send_telegram(
+            "📊 *Google Sheets connected!*\n"
+            "Signals + Trades will auto-log ✅"
+        )
 
     # Auto generate token on startup
     print("🔑 Auto-generating token on startup...")
@@ -1719,7 +1962,109 @@ def main():
     expiries = refresh_expiries()
     current_expiries.update(expiries)
 
+    # Auto-stop after 6 hours 8 min
+    # Starts 9:05 AM → stops 3:05 PM IST
+    # Pre-market 9:05-9:13 AM + Live 9:13-3:05 PM ✅
+    start_time = time.time()
+    MAX_RUNTIME_SECONDS = 6 * 60 * 60  # Exactly 6 hours → 9:05 AM to 3:05 PM IST
+
+    # ── PRE-MARKET PHASE (9:05-9:13 AM) ──────────────────────
+    now_ist = datetime.now(IST)
+    t_now   = now_ist.time()
+
+    if t_now < dtime(9, 13):
+        print("🌅 Pre-market phase starting...")
+
+        # Fetch global markets
+        print("  → Fetching global markets...")
+        global_data = fetch_global_markets()
+
+        # Fetch VIX early
+        print("  → Fetching VIX...")
+        vix, vix_chg, vix_chg_pct = fetch_vix()
+
+        # Format pre-market message
+        now_fmt  = fmt_date()
+        lines    = []
+        lines.append(f"🌅 *PRE-MARKET BRIEF · {now_fmt}*")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+        # Global markets
+        if global_data:
+            icons = {"GIFT Nifty":"🇮🇳","Dow Fut":"🇺🇸","Crude":"🛢️","USD/INR":"💵"}
+            overall = 0
+            for name, d in global_data.items():
+                if not d: continue
+                chg_p = d.get("chg_pct", 0)
+                icon  = icons.get(name, "📊")
+                color = "🟢" if chg_p > 0.3 else "🔴" if chg_p < -0.3 else "🟡"
+                price = d.get("price", 0)
+                if name == "GIFT Nifty":
+                    chg = d.get("chg", 0)
+                    lines.append(f"{icon} *{name}:* {price:,.0f} ({chg:+.0f} | {chg_p:+.2f}%) {color}")
+                    if chg > 50:
+                        lines.append(f"   → Gap UP expected at open 📈")
+                    elif chg < -50:
+                        lines.append(f"   → Gap DOWN expected at open 📉")
+                    else:
+                        lines.append(f"   → Flat opening expected ➡️")
+                else:
+                    lines.append(f"{icon} {name}: {price:,.2f} ({chg_p:+.2f}%) {color}")
+                overall += chg_p if name != "USD/INR" else -chg_p
+
+            bias = ("🟢 *BULLISH* — Positive for markets" if overall > 0.5 else
+                    "🔴 *BEARISH* — Negative for markets" if overall < -0.5 else
+                    "🟡 *NEUTRAL* — Mixed signals")
+            lines.append(f"\n📊 Global Bias: {bias}")
+
+        # VIX
+        if vix > 0:
+            lvl = ("🔵 VERY LOW" if vix < 11 else "🟢 LOW" if vix < 14 else
+                   "🟡 MODERATE" if vix < 17 else "🟠 HIGH" if vix < 20 else "🔴 VERY HIGH")
+            lines.append(f"\n🌡️ *VIX:* {vix} {lvl} ({vix_chg:+.2f} | {vix_chg_pct:+.2f}%)")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+        # Expiry warning
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        expiring  = [n for n, e in expiries.items() if e == today_str]
+        if expiring:
+            names = " + ".join(expiring)
+            lines.append(f"⚡ *EXPIRY TODAY: {names}*")
+            lines.append("⚠️ Reduce size 50% · Exit by 2:00 PM")
+        else:
+            # Show next expiries
+            lines.append("📅 *Next Expiries:*")
+            for n, e in expiries.items():
+                lines.append(f"   {n}: {fmt_date(e)}")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("⏰ *Wait till 9:30 AM to enter*")
+        lines.append("❌ Do NOT trade 9:15–9:30 AM")
+        lines.append("📡 First signal at 9:30 AM")
+        lines.append("\n_OC Radar v7 · Educational only_")
+
+        send_telegram("\n".join(lines))
+        print("✅ Pre-market brief sent!")
+
+        # Wait till 9:13 AM
+        while datetime.now(IST).time() < dtime(9, 13):
+            check_telegram_updates()
+            time.sleep(10)
+
+    print("🚀 Live market phase starting...")
+
     while True:
+        # Check runtime limit
+        elapsed = time.time() - start_time
+        if elapsed >= MAX_RUNTIME_SECONDS:
+            print("⏰ 2 hour limit reached — stopping gracefully")
+            send_telegram(
+                "⏸ *Session handoff*\n"
+                "Next session starts in 5 min automatically\n"
+                "Signals continue uninterrupted! 📡"
+            )
+            break
         try:
             now   = datetime.now(IST)
             today = now.strftime("%Y-%m-%d")
@@ -1744,8 +2089,8 @@ def main():
                 time.sleep(60)
                 continue
 
-            # Auto generate token at 8:55 AM daily
-            if dtime(8, 55) <= t <= dtime(8, 59) and not token_generated_today:
+            # Auto generate token at startup (9:13 AM daily)
+            if dtime(9, 13) <= t <= dtime(9, 17) and not token_generated_today:
                 print("🔑 Auto-generating daily token at 8:55 AM...")
                 if not auto_generate_token():
                     # Fallback to manual
@@ -1795,8 +2140,15 @@ def main():
             if dtime(15, 31) <= t <= dtime(15, 35) and not eod_sent:
                 if results:
                     send_eod_summary(results, expiries)
-                eod_sent        = True
-                open_alert_sent = False
+                # Auto-import trades from Dhan
+                print("📥 Auto-importing trades from Dhan...")
+                imported = auto_import_trades_from_dhan()
+                # Log EOD P&L to Google Sheets
+                log_eod_pnl_to_sheet(results, daily_signals_count, daily_trades)
+                eod_sent           = True
+                open_alert_sent    = False
+                daily_signals_count = 0
+                daily_trades        = []
 
             # Reset daily flags at midnight
             if t < dtime(0, 1):
@@ -1917,6 +2269,15 @@ def main():
                     send_telegram(msg)
                     update_prev_scores(results)
                     print(f"📨 Sent — {reason} — Window: {window}")
+
+                    # Auto-log signals to Google Sheets
+                    for name, sig in results.items():
+                        if sig and sig.get("action") != "SKIP":
+                            log_signal_to_sheet(
+                                name, sig, ping, resp,
+                                window, pcr_trends
+                            )
+                    daily_signals_count += 1
                 else:
                     print(f"⏸ Skipped — {reason}")
 

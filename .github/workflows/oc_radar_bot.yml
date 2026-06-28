@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════════════
 # OC RADAR BOT — GitHub Actions Workflow
-# Runs automatically on Indian market days
+# Single job: 9:05 AM – 3:05 PM IST (6 hours exactly)
 # Free forever — no proxy issues!
 # ══════════════════════════════════════════════════════════════
 
@@ -8,32 +8,30 @@ name: OC Radar Bot
 
 on:
   schedule:
-    # Run at 8:55 AM IST = 3:25 AM UTC (Mon-Fri)
-    - cron: '25 3 * * 1-5'
-  workflow_dispatch:  # Allow manual trigger anytime
+    # 9:05 AM IST = 3:35 AM UTC (Mon-Fri)
+    - cron: '35 3 * * 1-5'
+  workflow_dispatch:  # Manual trigger anytime
+
+env:
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   run_bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 390  # 6.5 hours = covers full market day
+    timeout-minutes: 355  # 5h55m — safely under 6hr limit
 
     steps:
-      # Step 1 — Get the code
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2 — Setup Python
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # Step 3 — Install dependencies
       - name: Install dependencies
-        run: |
-          pip install requests pytz
+        run: pip install requests pytz gspread google-auth
 
-      # Step 4 — Create .env from GitHub Secrets
       - name: Create .env file
         run: |
           cat > $HOME/.env << ENVEOF
@@ -42,21 +40,16 @@ jobs:
           DHAN_CLIENT_ID=${{ secrets.DHAN_CLIENT_ID }}
           DHAN_PIN=${{ secrets.DHAN_PIN }}
           DHAN_TOTP_SECRET=${{ secrets.DHAN_TOTP_SECRET }}
+          GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS=${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           ENVEOF
           chmod 600 $HOME/.env
           echo "✅ .env created"
 
-      # Step 5 — Verify secrets loaded
       - name: Verify setup
         run: |
-          echo "Python version:"
-          python --version
-          echo "Bot file exists:"
-          ls -la oc_radar/oc_radar_bot.py
+          echo "Python: $(python --version)"
+          echo "Bot: $(ls -la oc_radar/oc_radar_bot.py)"
 
-      # Step 6 — Run the bot
       - name: Run OC Radar Bot
-        run: |
-          python oc_radar/oc_radar_bot.py
-        env:
-          PYTHONUNBUFFERED: "1"
+        run: python oc_radar/oc_radar_bot.py
