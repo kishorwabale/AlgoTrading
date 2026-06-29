@@ -18,7 +18,7 @@ env:
 jobs:
   run_bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355  # 5h55m — safely under 6hr limit
+    timeout-minutes: 355  # 5h55m = safely under 6hr GitHub limit  # 5h55m — safely under 6hr limit
 
     steps:
       - name: Checkout repository
