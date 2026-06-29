@@ -1249,9 +1249,134 @@ def top_oi_changes(changes, spot):
     return out
 
 # ══════════════════════════════════════════════════════════════
+# PHASE 1 — DYNAMIC WEIGHT SYSTEM
+# Market Regime Detection + VIX Adjustment
+# ══════════════════════════════════════════════════════════════
+
+def detect_market_regime(oicr, vix, is_expiry, pcr, mpd):
+    """
+    Detect current market regime from live data
+    Returns regime name + description
+    """
+    if is_expiry:
+        return "EXPIRY", "⚡ Expiry day — Max Pain dominates"
+    elif oicr < 35 and vix > 14:
+        return "VOLATILE_TREND", "🔥 Volatile trending — OI signals strongest"
+    elif oicr < 45:
+        return "TRENDING", "📈 Trending day — OI buildup leads"
+    elif oicr > 65:
+        if abs(pcr - 1.0) < 0.1:
+            return "RANGE_NEUTRAL", "📌 Range neutral — Max Pain dominates"
+        else:
+            return "RANGE_BIASED", "📌 Range with bias — PCR contrarian"
+    elif vix > 18:
+        return "HIGH_VIX", "😱 High fear — PE signals stronger"
+    else:
+        return "NORMAL", "📊 Normal market — balanced weights"
+
+# Weight multipliers per regime
+# Each signal gets a multiplier (1.0 = default, 2.0 = double weight)
+REGIME_WEIGHTS = {
+    "EXPIRY": {
+        "pcr":      0.5,   # PCR less reliable on expiry
+        "max_pain": 3.0,   # Max Pain is GOD on expiry!
+        "cw_hit":   2.0,   # Walls very powerful on expiry
+        "oicr":     1.0,
+        "oi_build": 0.8,
+        "oi_ratio": 1.0,
+        "iv_skew":  1.5,   # IV skew matters on expiry
+        "straddle": 1.5,
+    },
+    "VOLATILE_TREND": {
+        "pcr":      1.5,
+        "max_pain": 0.3,   # MP meaningless in volatile trend
+        "cw_hit":   2.0,   # Walls as targets/reversals
+        "oicr":     2.5,   # OICR breakout is key
+        "oi_build": 2.0,   # OI buildup confirms direction
+        "oi_ratio": 1.5,
+        "iv_skew":  1.0,
+        "straddle": 0.5,
+    },
+    "TRENDING": {
+        "pcr":      1.5,
+        "max_pain": 0.5,   # MP less relevant in trend
+        "cw_hit":   1.5,
+        "oicr":     2.0,
+        "oi_build": 1.5,
+        "oi_ratio": 1.5,
+        "iv_skew":  1.0,
+        "straddle": 0.8,
+    },
+    "RANGE_NEUTRAL": {
+        "pcr":      1.0,
+        "max_pain": 2.5,   # MP most important in range
+        "cw_hit":   0.5,   # Walls less reliable in range
+        "oicr":     0.5,
+        "oi_build": 0.5,
+        "oi_ratio": 0.8,
+        "iv_skew":  1.5,
+        "straddle": 2.0,   # Straddle = range predictor
+    },
+    "RANGE_BIASED": {
+        "pcr":      2.0,   # PCR contrarian very useful
+        "max_pain": 2.0,
+        "cw_hit":   0.8,
+        "oicr":     0.5,
+        "oi_build": 0.8,
+        "oi_ratio": 1.0,
+        "iv_skew":  1.5,
+        "straddle": 1.5,
+    },
+    "HIGH_VIX": {
+        "pcr":      1.5,
+        "max_pain": 1.0,
+        "cw_hit":   1.5,
+        "oicr":     1.5,
+        "oi_build": 1.0,
+        "oi_ratio": 2.0,   # OI ratio more reliable in fear
+        "iv_skew":  2.0,   # IV skew very important
+        "straddle": 0.5,   # Straddle inflated by fear
+    },
+    "NORMAL": {
+        "pcr":      1.0,
+        "max_pain": 1.0,
+        "cw_hit":   1.0,
+        "oicr":     1.0,
+        "oi_build": 1.0,
+        "oi_ratio": 1.0,
+        "iv_skew":  1.0,
+        "straddle": 1.0,
+    },
+}
+
+def get_vix_multiplier(vix):
+    """
+    VIX-based score adjustment
+    Low VIX = less reliable signals
+    High VIX = stronger PE signals
+    """
+    if vix == 0:
+        return 1.0, 1.0, "VIX unknown"
+    elif vix < 11:
+        return 0.8, 0.8, "VIX very low — signals weaker"
+    elif vix < 14:
+        return 1.0, 1.0, "VIX normal — standard weights"
+    elif vix < 17:
+        return 0.9, 1.1, "VIX moderate — PE slightly favored"
+    elif vix < 20:
+        return 0.8, 1.3, "VIX high — PE signals stronger"
+    else:
+        return 0.0, 0.0, "VIX very high — SKIP all signals"
+
+# Store current regime for Telegram display
+current_regime     = {}
+current_regime_desc= {}
+
+# ══════════════════════════════════════════════════════════════
 # SIGNAL ENGINE
 # ══════════════════════════════════════════════════════════════
-def compute_signals(name, spot, data, ce_added, pe_added, bonus):
+def compute_signals(name, spot, data, ce_added, pe_added, bonus,
+                    vix=0, is_expiry=False):
     if not data or spot == 0:
         return None
     active = [d for d in data if abs(d["strike"] - spot) / spot <= 0.08]
@@ -1296,50 +1421,121 @@ def compute_signals(name, spot, data, ce_added, pe_added, bonus):
     # IV Skew
     ivs = (atm["peIV"] or 0) - (atm["ceIV"] or 0)
 
-    # ── CE SCORE ─────────────────────────────────────────────
+    # ── PHASE 1: MARKET REGIME DETECTION ─────────────────────
+    regime, regime_desc = detect_market_regime(
+        oicr, vix, is_expiry, pcr, mpd
+    )
+    w = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["NORMAL"])
+
+    # VIX multiplier
+    ce_vix_mult, pe_vix_mult, vix_note = get_vix_multiplier(vix)
+
+    # Store for Telegram display
+    current_regime[name]      = regime
+    current_regime_desc[name] = regime_desc
+
+    # If VIX too high — skip everything
+    if ce_vix_mult == 0:
+        return None
+
+    # ── CW / PW HIT SIGNAL (NEW — most impactful!) ───────────
+    # When spot hits Call Wall = strong resistance = PE signal
+    # When spot hits Put Wall  = strong support    = CE signal
+    # When spot BREAKS above CW = CE breakout signal!
+    # When spot BREAKS below PW = PE breakdown signal!
+    cw_hit_boost_pe = 0
+    cw_hit_boost_ce = 0
+
+    if spot >= cw:
+        # Spot AT or ABOVE Call Wall
+        if spot < cw * 1.005:
+            # At CW — strong resistance — PE boost
+            cw_hit_boost_pe = 22
+            cw_hit_boost_ce = -12  # Don't buy CE at resistance!
+        else:
+            # BREAKOUT above CW — CE boost
+            cw_hit_boost_ce = 15
+            cw_hit_boost_pe = -5
+
+    if spot <= pw:
+        # Spot AT or BELOW Put Wall
+        if spot > pw * 0.995:
+            # At PW — strong support — CE boost
+            cw_hit_boost_ce += 22
+            cw_hit_boost_pe += -12  # Don't buy PE at support!
+        else:
+            # BREAKDOWN below PW — PE boost
+            cw_hit_boost_pe += 15
+            cw_hit_boost_ce += -5
+
+    # ── CE SCORE — Dynamic weights applied ───────────────────
     ce_s = 0
-    # PCR — higher weight, finer thresholds
-    ce_s += 25 if pcr > 1.35 else 20 if pcr > 1.20 else 15 if pcr > 1.10 else 8 if pcr > 1.0 else 0
-    # OI Ratio — more granular
-    ce_s += 18 if oir < 0.38 else 12 if oir < 0.43 else 6 if oir < 0.48 else 0
-    # Max Pain — KEY: spot ABOVE MP = CE magnet
-    ce_s += 20 if mpd > 2.0 else 15 if mpd > 1.0 else 10 if mpd > 0.2 else 5 if mpd > 0 else 0
-    # Put Wall distance — floor below = CE safe
-    ce_s += 12 if dpw > 3 else 8 if dpw > 1.5 else 4 if dpw > 0.5 else 0
+    # PCR
+    pcr_ce = 25 if pcr>1.35 else 20 if pcr>1.20 else 15 if pcr>1.10 else 8 if pcr>1.0 else 0
+    ce_s += round(pcr_ce * w["pcr"])
+    # OI Ratio
+    oir_ce = 18 if oir<0.38 else 12 if oir<0.43 else 6 if oir<0.48 else 0
+    ce_s += round(oir_ce * w["oi_ratio"])
+    # Max Pain
+    mp_ce = 20 if mpd>2.0 else 15 if mpd>1.0 else 10 if mpd>0.2 else 5 if mpd>0 else 0
+    ce_s += round(mp_ce * w["max_pain"])
+    # Put Wall distance
+    pw_ce = 12 if dpw>3 else 8 if dpw>1.5 else 4 if dpw>0.5 else 0
+    ce_s += round(pw_ce * w["cw_hit"])
     # Call Wall distance — CW far = room to rise
-    ce_s += 10 if dcw > 2 else 7 if dcw > 1 else 3 if dcw > 0.3 else 0
-    # OICR — breakout detection
-    ce_s += 15 if oicr < 35 else 12 if oicr < 45 else 6 if oicr < 55 else 0
+    cw_ce = 10 if dcw>2 else 7 if dcw>1 else 3 if dcw>0.3 else 0
+    ce_s += round(cw_ce * 1.0)
+    # OICR
+    oicr_ce = 15 if oicr<35 else 12 if oicr<45 else 6 if oicr<55 else 0
+    ce_s += round(oicr_ce * w["oicr"])
     # Straddle
-    ce_s += 8 if sp > 1.5 else 6 if sp > 0.8 else 4
+    strd_ce = 8 if sp>1.5 else 6 if sp>0.8 else 4
+    ce_s += round(strd_ce * w["straddle"])
     # IV Skew
-    ce_s += 8 if ivs < -1.5 else 5 if ivs < -0.5 else 0
+    ivs_ce = 8 if ivs<-1.5 else 5 if ivs<-0.5 else 0
+    ce_s += round(ivs_ce * w["iv_skew"])
+    # CW/PW Hit boost
+    ce_s += round(cw_hit_boost_ce * w["cw_hit"])
     # Bonus from OI buildup + VIX + Futures
-    if bonus > 0: ce_s += min(bonus, 15)
+    if bonus > 0: ce_s += round(min(bonus, 15) * w["oi_build"])
     elif ce_added > 500000: ce_s -= 5
+    # Apply VIX multiplier
+    ce_s = round(ce_s * ce_vix_mult)
     ce_s = min(100, max(0, ce_s))
 
-    # ── PE SCORE ─────────────────────────────────────────────
+    # ── PE SCORE — Dynamic weights applied ───────────────────
     pe_s = 0
-    # PCR — KEY FIX: lower thresholds catch today's 0.73-0.78!
-    pe_s += 25 if pcr < 0.65 else 20 if pcr < 0.75 else 15 if pcr < 0.85 else 8 if pcr < 0.95 else 0
-    # OI Ratio — more granular
-    pe_s += 18 if oir > 0.62 else 12 if oir > 0.57 else 6 if oir > 0.52 else 0
-    # Max Pain — KEY FIX: spot BELOW MP by even 0.2% = PE signal
-    pe_s += 20 if mpd < -2.0 else 15 if mpd < -1.0 else 10 if mpd < -0.2 else 5 if mpd < 0 else 0
-    # Call Wall — KEY FIX: CW close to spot = resistance = PE boost
-    pe_s += 12 if dcw < 0.3 else 8 if dcw < 0.8 else 4 if dcw < 1.5 else 0
+    # PCR
+    pcr_pe = 25 if pcr<0.65 else 20 if pcr<0.75 else 15 if pcr<0.85 else 8 if pcr<0.95 else 0
+    pe_s += round(pcr_pe * w["pcr"])
+    # OI Ratio
+    oir_pe = 18 if oir>0.62 else 12 if oir>0.57 else 6 if oir>0.52 else 0
+    pe_s += round(oir_pe * w["oi_ratio"])
+    # Max Pain
+    mp_pe = 20 if mpd<-2.0 else 15 if mpd<-1.0 else 10 if mpd<-0.2 else 5 if mpd<0 else 0
+    pe_s += round(mp_pe * w["max_pain"])
+    # Call Wall near spot = resistance = PE
+    cw_pe = 12 if dcw<0.3 else 8 if dcw<0.8 else 4 if dcw<1.5 else 0
+    pe_s += round(cw_pe * w["cw_hit"])
     # Put Wall distance
-    pe_s += 10 if dpw > 2.5 else 12 if dpw > 1.5 else 8 if dpw > 0.8 else 3
-    # OICR — breakout detection
-    pe_s += 15 if oicr < 35 else 12 if oicr < 45 else 6 if oicr < 55 else 0
+    pw_pe = 10 if dpw>2.5 else 12 if dpw>1.5 else 8 if dpw>0.8 else 3
+    pe_s += round(pw_pe * 1.0)
+    # OICR
+    oicr_pe = 15 if oicr<35 else 12 if oicr<45 else 6 if oicr<55 else 0
+    pe_s += round(oicr_pe * w["oicr"])
     # Straddle
-    pe_s += 8 if sp > 1.5 else 6 if sp > 0.8 else 4
+    strd_pe = 8 if sp>1.5 else 6 if sp>0.8 else 4
+    pe_s += round(strd_pe * w["straddle"])
     # IV Skew
-    pe_s += 8 if ivs > 2.0 else 5 if ivs > 0.5 else 0
+    ivs_pe = 8 if ivs>2.0 else 5 if ivs>0.5 else 0
+    pe_s += round(ivs_pe * w["iv_skew"])
+    # CW/PW Hit boost
+    pe_s += round(cw_hit_boost_pe * w["cw_hit"])
     # Bonus from OI buildup + VIX + Futures
-    if bonus < 0: pe_s += min(abs(bonus), 15)
+    if bonus < 0: pe_s += round(min(abs(bonus), 15) * w["oi_build"])
     elif pe_added > 500000: pe_s -= 5
+    # Apply VIX multiplier
+    pe_s = round(pe_s * pe_vix_mult)
     pe_s = min(100, max(0, pe_s))
 
     best = max(ce_s, pe_s)
@@ -1382,6 +1578,17 @@ def compute_signals(name, spot, data, ce_added, pe_added, bonus):
     elif pe_added < -200000:
         ois = f"PE -{abs(pe_added)//100000:.1f}L removed — bears exiting"
 
+    # CW/PW hit label for message
+    wall_signal = ""
+    if cw_hit_boost_pe >= 20:
+        wall_signal = f"⚠️ CW HIT ₹{cw:,} — Strong resistance! PE reversal likely"
+    elif cw_hit_boost_ce >= 20:
+        wall_signal = f"✅ PW HIT ₹{pw:,} — Strong support! CE bounce likely"
+    elif cw_hit_boost_ce >= 15:
+        wall_signal = f"💥 CW BREAKOUT above ₹{cw:,}! CE momentum signal"
+    elif cw_hit_boost_pe >= 15:
+        wall_signal = f"💥 PW BREAKDOWN below ₹{pw:,}! PE momentum signal"
+
     return {
         "spot": spot, "mp": mp, "mp_dist": round(mpd, 2),
         "pcr": pcr, "oicr": oicr, "mkt": mkt,
@@ -1393,6 +1600,9 @@ def compute_signals(name, spot, data, ce_added, pe_added, bonus):
         "ce_entry": ce_en, "pe_entry": pe_en,
         "ce_added": ce_added, "pe_added": pe_added,
         "oi_signal": ois,
+        "wall_signal": wall_signal,
+        "regime": regime,
+        "regime_desc": regime_desc,
         "exp_high": round(spot + strd),
         "exp_low":  round(spot - strd),
     }
@@ -1497,6 +1707,12 @@ def format_message(results, buildups, top_chg, ping, resp,
             best_name  = n
             best_side  = side_lbl
 
+    # Show market regime from best index signal
+    for n, s in results.items():
+        if s and s.get("regime"):
+            lines.append(f"📊 Regime: *{s['regime']}* — {s.get('regime_desc','')}")
+            break
+
     # Composite
     comp_ce = round(
         results.get("BANKNIFTY",{}).get("ce_score",0)*0.40 +
@@ -1565,6 +1781,11 @@ def format_message(results, buildups, top_chg, ping, resp,
         pat, meaning, _ = buildups.get(name, ("NEUTRAL", "—", 0))
         if pat not in ("NEUTRAL", "BOTH ADDING"):
             lines.append(f"{pat} — {meaning}")
+
+        # CW/PW Hit signal — show prominently!
+        wall_sig = sig.get("wall_signal", "")
+        if wall_sig:
+            lines.append(f"🎯 {wall_sig}")
 
         # PCR Trend — only significant ones
         if pcr_trends and name in pcr_trends:
@@ -2345,7 +2566,8 @@ def main():
 
                     sig = compute_signals(
                         name, spot, data, ce_a, pe_a,
-                        bscore + vix_adj + fut_adj + pcr_adj
+                        bscore + vix_adj + fut_adj + pcr_adj,
+                        vix=vix, is_expiry=is_expiry_day
                     )
                     results[name] = sig
 
