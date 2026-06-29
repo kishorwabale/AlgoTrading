@@ -688,19 +688,20 @@ def place_super_order(name, strike, side, lot_size, entry_ltp, is_late=False):
             gain_amt  = round(gain_pts * lot_size)
             loss_amt  = round(loss_pts * lot_size)
             return order_id, (
-                f"✅ *SUPER ORDER PLACED!*\n"
+                f"🚀 *ORDER PLACED SUCCESSFULLY!*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"*{name}* {side} {strike:,}\n"
+                f"*BUY {name} {side} {strike:,}*\n"
                 f"Order ID: `{order_id}`\n"
                 f"Status: {status}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Entry: ₹{entry_ltp} (MARKET)\n"
-                f"Target: ₹{target_price} (+{round((target_pct-1)*100)}%) → +₹{gain_amt}\n"
-                f"SL: ₹{sl_price} (-{round((1-sl_pct)*100)}%) → -₹{loss_amt}\n"
+                f"Entry Price:  ₹{entry_ltp} (MARKET)\n"
+                f"Target:       ₹{target_price} (+{round((target_pct-1)*100)}%) → *+₹{gain_amt}*\n"
+                f"Stop Loss:    ₹{sl_price} (-{round((1-sl_pct)*100)}%) → *-₹{loss_amt}*\n"
+                f"Lot Size:     {lot_size} qty\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ Target + SL auto-set\n"
+                f"✅ Target + SL auto-set on Dhan\n"
                 f"✅ Monitor in Dhan app\n"
-                f"_OC Radar Phase 2_"
+                f"⏰ Exit before 3:05 PM"
             )
         else:
             err = data.get("remarks", data.get("message", "Unknown error"))
@@ -798,21 +799,31 @@ def handle_telegram_update(update):
                 "lot": lot, "ltp": ltp, "is_late": is_late,
             }
 
-            # Rich confirmation message
+            # Clean readable confirmation message
+            lot_size_map = {"NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20}
+            lot_size = lot_size_map.get(name, lot)
+            capital  = round(ltp * lot)
+            session_label = "⚡ Late Session" if is_late else "✅ Normal Session"
+            exchange = "BSE F&O" if name == "SENSEX" else "NSE F&O"
+
             confirm_msg = (
-                f"⚠️ *ORDER CONFIRMATION*\n"
+                f"🔔 *ORDER CONFIRMATION*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"*{name}* {side} {strike:,}\n"
-                f"Qty: {lot} · MARKET · INTRADAY\n"
+                f"*BUY {name} {side} {strike:,}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Entry: ₹{ltp} (approx)\n"
-                f"Target: ₹{target} ({tpct}) → +₹{gain_amt}\n"
-                f"SL: ₹{sl} ({slpct}) → -₹{loss_amt}\n"
+                f"Entry Price:  ₹{ltp}\n"
+                f"Target:       ₹{target} ({tpct}) → *+₹{gain_amt}*\n"
+                f"Stop Loss:    ₹{sl} ({slpct}) → *-₹{loss_amt}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{'⚡ LATE SESSION — Strict rules!' if is_late else '✅ Normal session'}\n"
+                f"Lot Size:     {lot_size} qty\n"
+                f"Lots:         {lot // lot_size if lot >= lot_size else 1}\n"
+                f"Exchange:     {exchange}\n"
+                f"Product:      INTRADAY · MARKET\n"
+                f"Session:      {session_label}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Reply /confirm_{name}_{side}_{strike} to PLACE ORDER\n"
-                f"Reply /cancel to skip\n"
+                f"✅ Reply: /confirm_{name}_{side}_{strike}\n"
+                f"❌ Reply: /cancel\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚠️ *Real money will be used!*"
             )
             send_telegram(confirm_msg)
@@ -1123,28 +1134,54 @@ def fetch_option_chain(scrip, seg, expiry):
     url = "https://api.dhan.co/v2/optionchain"
     headers = {
         "access-token": DHAN_API_KEY,
-        "client-id": DHAN_CLIENT_ID,
+        "client-id":    DHAN_CLIENT_ID,
         "Content-Type": "application/json",
     }
     payload = {"UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": expiry}
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=10)
-        r.raise_for_status()
+        # Don't raise on 4xx — just parse the error
+        if r.status_code == 401:
+            print(f"  ⚠️ Dhan API 401 — token expired or IP not whitelisted")
+            return None
+        if r.status_code == 429:
+            print(f"  ⚠️ Dhan API rate limit — waiting 3 seconds")
+            time.sleep(3)
+            return None
+        if not r.text.strip():
+            print(f"  ⚠️ Dhan API empty response for scrip {scrip}")
+            return None
         return r.json()
     except Exception as e:
-        print(f"Dhan API error scrip {scrip}: {e}")
+        print(f"  ⚠️ Dhan API error scrip {scrip}: {e}")
         return None
 
 def parse_oc(raw):
+    # Handle error responses
     if not raw:
+        return None, []
+    # If Dhan returns error string or non-dict
+    if isinstance(raw, str):
+        print(f"  ⚠️ OC API returned string: {raw[:100]}")
+        return None, []
+    if not isinstance(raw, dict):
+        print(f"  ⚠️ OC API returned unexpected type: {type(raw)}")
+        return None, []
+    # Check for Dhan error response
+    if raw.get("status") == "failure" or raw.get("errorCode"):
+        print(f"  ⚠️ OC API error: {raw.get('remarks', raw.get('errorCode', 'Unknown'))}")
         return None, []
     spot   = raw.get("last_price") or raw.get("underlyingLastPrice") or 0
     chains = raw.get("data", raw.get("optionChain", []))
+    if not chains:
+        return spot, []
     parsed = []
     for row in chains:
+        if not isinstance(row, dict):
+            continue
         strike = row.get("strikePrice", 0)
-        ce = row.get("callOption", row.get("CE", {}))
-        pe = row.get("putOption",  row.get("PE", {}))
+        ce = row.get("callOption", row.get("CE", {})) or {}
+        pe = row.get("putOption",  row.get("PE", {})) or {}
         parsed.append({
             "strike": strike,
             "ceLTP":  ce.get("lastTradedPrice", ce.get("ltp", 0)),
@@ -1259,38 +1296,73 @@ def compute_signals(name, spot, data, ce_added, pe_added, bonus):
     # IV Skew
     ivs = (atm["peIV"] or 0) - (atm["ceIV"] or 0)
 
-    # CE Score
-    ce_s  = 0
-    ce_s += 20 if pcr>1.3 else 15 if pcr>1.1 else 10 if pcr>1.0 else 5 if pcr>0.9 else 0
-    ce_s += 15 if oir<0.40 else 10 if oir<0.45 else 5 if oir<0.5 else 0
-    ce_s += 15 if mpd>1.5  else 10 if mpd>0.5  else 5 if mpd>0   else 0
-    ce_s += 15 if dcw>2    else 10 if dcw>1     else 5 if dcw>0.3 else 0
-    ce_s += 10 if sp>1.5   else 7  if sp>0.8    else 5
-    ce_s += 12 if oicr<35  else 9  if oicr<45   else 5 if oicr<65 else 0
-    ce_s += 8  if ivs<-1   else 5  if ivs<0     else 0
-    if bonus > 0: ce_s += bonus
+    # ── CE SCORE ─────────────────────────────────────────────
+    ce_s = 0
+    # PCR — higher weight, finer thresholds
+    ce_s += 25 if pcr > 1.35 else 20 if pcr > 1.20 else 15 if pcr > 1.10 else 8 if pcr > 1.0 else 0
+    # OI Ratio — more granular
+    ce_s += 18 if oir < 0.38 else 12 if oir < 0.43 else 6 if oir < 0.48 else 0
+    # Max Pain — KEY: spot ABOVE MP = CE magnet
+    ce_s += 20 if mpd > 2.0 else 15 if mpd > 1.0 else 10 if mpd > 0.2 else 5 if mpd > 0 else 0
+    # Put Wall distance — floor below = CE safe
+    ce_s += 12 if dpw > 3 else 8 if dpw > 1.5 else 4 if dpw > 0.5 else 0
+    # Call Wall distance — CW far = room to rise
+    ce_s += 10 if dcw > 2 else 7 if dcw > 1 else 3 if dcw > 0.3 else 0
+    # OICR — breakout detection
+    ce_s += 15 if oicr < 35 else 12 if oicr < 45 else 6 if oicr < 55 else 0
+    # Straddle
+    ce_s += 8 if sp > 1.5 else 6 if sp > 0.8 else 4
+    # IV Skew
+    ce_s += 8 if ivs < -1.5 else 5 if ivs < -0.5 else 0
+    # Bonus from OI buildup + VIX + Futures
+    if bonus > 0: ce_s += min(bonus, 15)
     elif ce_added > 500000: ce_s -= 5
     ce_s = min(100, max(0, ce_s))
 
-    # PE Score
-    pe_s  = 0
-    pe_s += 20 if pcr<0.7  else 15 if pcr<0.85 else 10 if pcr<1.0 else 5 if pcr<1.1 else 0
-    pe_s += 15 if oir>0.60 else 10 if oir>0.55 else 5  if oir>0.5 else 0
-    pe_s += 15 if mpd<-1.5 else 10 if mpd<-0.5 else 5  if mpd<0   else 0
-    pe_s += 15 if dpw>2    else 10 if dpw>1     else 5  if dpw>0.3 else 0
-    pe_s += 10 if sp>1.5   else 7  if sp>0.8    else 5
-    pe_s += 12 if oicr<35  else 9  if oicr<45   else 5  if oicr<65 else 0
-    pe_s += 8  if ivs>2    else 5  if ivs>0.5   else 0
-    if bonus < 0: pe_s += abs(bonus)
+    # ── PE SCORE ─────────────────────────────────────────────
+    pe_s = 0
+    # PCR — KEY FIX: lower thresholds catch today's 0.73-0.78!
+    pe_s += 25 if pcr < 0.65 else 20 if pcr < 0.75 else 15 if pcr < 0.85 else 8 if pcr < 0.95 else 0
+    # OI Ratio — more granular
+    pe_s += 18 if oir > 0.62 else 12 if oir > 0.57 else 6 if oir > 0.52 else 0
+    # Max Pain — KEY FIX: spot BELOW MP by even 0.2% = PE signal
+    pe_s += 20 if mpd < -2.0 else 15 if mpd < -1.0 else 10 if mpd < -0.2 else 5 if mpd < 0 else 0
+    # Call Wall — KEY FIX: CW close to spot = resistance = PE boost
+    pe_s += 12 if dcw < 0.3 else 8 if dcw < 0.8 else 4 if dcw < 1.5 else 0
+    # Put Wall distance
+    pe_s += 10 if dpw > 2.5 else 12 if dpw > 1.5 else 8 if dpw > 0.8 else 3
+    # OICR — breakout detection
+    pe_s += 15 if oicr < 35 else 12 if oicr < 45 else 6 if oicr < 55 else 0
+    # Straddle
+    pe_s += 8 if sp > 1.5 else 6 if sp > 0.8 else 4
+    # IV Skew
+    pe_s += 8 if ivs > 2.0 else 5 if ivs > 0.5 else 0
+    # Bonus from OI buildup + VIX + Futures
+    if bonus < 0: pe_s += min(abs(bonus), 15)
     elif pe_added > 500000: pe_s -= 5
     pe_s = min(100, max(0, pe_s))
 
-    best   = max(ce_s, pe_s)
-    action = "SKIP" if best < 50 else "BUY CE" if ce_s >= pe_s else "BUY PE"
-    size   = ("Full size ✅" if best >= 75 else
-              "70% size ⚠️" if best >= 55 else
-              "50% size ⚠️" if best >= 50 else "Skip ❌")
-    mkt    = "💥 BREAKOUT" if oicr < 45 else "⚠️ TRENDING" if oicr < 65 else "📌 RANGE"
+    best = max(ce_s, pe_s)
+
+    # ── NEW 4-BAND SYSTEM ────────────────────────────────────
+    # 0-49   → SKIP (silent)
+    # 50-64  → WATCH (show on Telegram, no /buy)
+    # 65-74  → CAUTION (show + /buy at 50% size)
+    # 75-100 → TRADE (full signal + /buy full size)
+    if best < 50:
+        action = "SKIP"
+        size   = "Skip ❌"
+    elif best < 65:
+        action = "BUY CE" if ce_s >= pe_s else "BUY PE"
+        size   = "👀 WATCH — Observe only (no trade)"
+    elif best < 75:
+        action = "BUY CE" if ce_s >= pe_s else "BUY PE"
+        size   = "⚠️ CAUTION — 50% size only"
+    else:
+        action = "BUY CE" if ce_s >= pe_s else "BUY PE"
+        size   = "✅ Full size"
+
+    mkt = "💥 BREAKOUT" if oicr < 45 else "⚠️ TRENDING" if oicr < 65 else "📌 RANGE"
 
     ce_st = round(spot / 100) * 100 + 100
     pe_st = round(spot / 100) * 100 - 100
@@ -1391,34 +1463,39 @@ def format_message(results, buildups, top_chg, ping, resp,
     }
     w_label = window_labels.get(window, "")
 
-    lines.append(f"📡 *OC RADAR v5 · {now_ist}*")
-    lines.append(f"⏱ Ping: `{ping} IST` → Response: `{resp} IST`")
+    lines.append(f"📡 *OC RADAR v7* · {now_ist}")
+    lines.append(f"⏱ {ping} → {resp} IST")
     if w_label:
         lines.append(f"⏰ {w_label}")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
-    # Global markets
-    g = format_global(global_data)
-    if g:
-        lines.append(g)
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-
-    # VIX
-    vix, vc, vcp = vix_data
-    if vix > 0:
-        lvl, adv, _ = analyze_vix(vix, vc, vcp)
-        lines.append(f"🌡️ *VIX: {vix}* {lvl} ({vc:+.2f} | {vcp:+.2f}%)")
-        lines.append(f"   {adv}")
-
-    # Futures
-    if fut_analysis:
-        lines.append("📊 *Futures Basis:*")
-        for name, fa in fut_analysis.items():
-            lines.append(
-                f"   {name} Fut {fa['fut']:,} | "
-                f"Basis {fa['basis']:+.0f}pts | {fa['sentiment']}"
-            )
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    # ── SCORE DASHBOARD (at top for quick glance) ─────────────
+    lines.append("📊 *SCORE DASHBOARD*")
+    best_name  = ""
+    best_score = 0
+    best_side  = ""
+    for n, s in results.items():
+        if not s:
+            lines.append(f"❌ {n:<12} — No data")
+            continue
+        ce = s["ce_score"]; pe = s["pe_score"]
+        top = max(ce, pe)
+        side_lbl = "CE" if ce >= pe else "PE"
+        if top >= 75:
+            band = "🟢 TRADE ⭐" if top == max(
+                max(r["ce_score"], r["pe_score"]) for r in results.values() if r
+            ) else "🟢 TRADE"
+        elif top >= 65:
+            band = "🟠 CAUTION"
+        elif top >= 50:
+            band = "🟡 WATCH"
+        else:
+            band = "🔴 SKIP"
+        lines.append(f"{n:<12} {side_lbl} {top:>3} {band}")
+        if top > best_score:
+            best_score = top
+            best_name  = n
+            best_side  = side_lbl
 
     # Composite
     comp_ce = round(
@@ -1431,83 +1508,97 @@ def format_message(results, buildups, top_chg, ping, resp,
         results.get("NIFTY",    {}).get("pe_score",0)*0.35 +
         results.get("SENSEX",   {}).get("pe_score",0)*0.25
     )
+    comp_top  = max(comp_ce, comp_pe)
+    comp_side = "CE" if comp_ce >= comp_pe else "PE"
+    comp_band = "🟢" if comp_top >= 75 else "🟡" if comp_top >= 50 else "🔴"
+    lines.append(f"{'Composite':<12} {comp_side} {comp_top:>3} {comp_band}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
     for name, sig in results.items():
         if not sig:
-            lines.append(f"\n*{name}* — ❌ No data"); continue
+            continue
 
         score   = (sig["ce_score"] if sig["action"]=="BUY CE" else
                    sig["pe_score"] if sig["action"]=="BUY PE" else
                    max(sig["ce_score"], sig["pe_score"]))
-        emoji   = "🟢" if score>=75 else "🟡" if score>=55 else "🔴"
-        act_ico = "📗" if sig["action"]=="BUY CE" else "📕" if sig["action"]=="BUY PE" else "⏸"
-        strike  = (sig["ce_strike"] if sig["action"]=="BUY CE" else
-                   sig["pe_strike"] if sig["action"]=="BUY PE" else 0)
-        entry   = (sig["ce_entry"]  if sig["action"]=="BUY CE" else
-                   sig["pe_entry"]  if sig["action"]=="BUY PE" else 0)
-        target  = round(entry*1.40) if entry else 0
-        sl      = round(entry*0.75) if entry else 0
+
+        if score >= 75:
+            band_emoji = "🟢"; band_label = "TRADE"
+        elif score >= 65:
+            band_emoji = "🟠"; band_label = "CAUTION"
+        elif score >= 50:
+            band_emoji = "🟡"; band_label = "WATCH"
+        else:
+            band_emoji = "🔴"; band_label = "SKIP"
+
+        # Skip SKIP band in detail section — already in dashboard
+        if band_label == "SKIP":
+            continue
+
+        act_ico = "📗" if sig["action"]=="BUY CE" else "📕"
+        side    = "CE" if sig["action"]=="BUY CE" else "PE"
+        strike  = sig["ce_strike"] if side=="CE" else sig["pe_strike"]
+        entry   = sig["ce_entry"]  if side=="CE" else sig["pe_entry"]
+        lot_sz  = INDICES_BASE.get(name, {}).get("lot", 30)
         exp_raw = expiries.get(name, "")
         exp     = fmt_date(exp_raw) if exp_raw else "—"
 
-        lines.append(f"\n*{name}* ₹{sig['spot']:,.0f} {sig['mkt']} · Expiry {exp}")
-        lines.append(f"{act_ico} *{sig['action']} {strike:,}* {emoji} Score: *{score}*")
-        lines.append(f"{sig['size']}")
-        if entry:
-            if is_late:
-                late_target = round(entry * 1.20)
-                late_sl     = round(entry * 0.85)
-                lines.append(f"Entry ₹{entry} · Target ₹{late_target} (+20%) · SL ₹{late_sl} (-15%)")
-                lines.append(f"⚡ *LATE SESSION* — Half size · Exit by *3:20 PM*")
-            else:
-                lines.append(f"Entry ₹{entry} · Target ₹{target} (+40%) · SL ₹{sl} (-25%)")
-            # Phase 2 — One tap order button with entry LTP
-            if sig["action"] != "SKIP":
-                trade_side   = "CE" if sig["action"] == "BUY CE" else "PE"
-                trade_strike = sig["ce_strike"] if trade_side == "CE" else sig["pe_strike"]
-                trade_ltp    = sig["ce_entry"]  if trade_side == "CE" else sig["pe_entry"]
-                late_flag    = "L" if is_late else "N"
-                lines.append(
-                    f"\n🚀 *ONE TAP ORDER:*"
-                    f" /buy_{name}_{trade_side}_{trade_strike}_{int(trade_ltp*100)}_{late_flag}"
-                )
-                lines.append(f"_(Entry + Target + SL auto-set · Confirm to place)_")
-        lines.append(
-            f"PCR {sig['pcr']} · OICR {sig['oicr']}% · MP {sig['mp']:,}"
-        )
-        lines.append(
-            f"CW {sig['call_wall']:,} · PW {sig['put_wall']:,} · "
-            f"Range {sig['exp_low']:,}–{sig['exp_high']:,}"
-        )
+        # Targets
+        if is_late:
+            tgt = round(entry * 1.20); sl = round(entry * 0.85)
+            tgt_lbl = "+20%"; sl_lbl = "-15%"
+            session_note = "⚡ Late Session · Exit by 3:05 PM"
+        else:
+            tgt = round(entry * 1.30); sl = round(entry * 0.75)
+            tgt_lbl = "+30%"; sl_lbl = "-25%"
+            session_note = ""
+
+        gain_amt = round((tgt - entry) * lot_sz)
+        loss_amt = round((entry - sl)  * lot_sz)
+
+        lines.append(f"\n{'🎯' if score>=75 else '📋'} *{name}* ₹{sig['spot']:,.0f} {sig['mkt']} · {exp}")
+        lines.append(f"{act_ico} *BUY {name} {side} {strike:,}* · Score *{score}* {band_emoji} [{band_label}]")
+        lines.append(f"PCR {sig['pcr']} · OICR {sig['oicr']}% · MP ₹{sig['mp']:,}")
+        lines.append(f"CW ₹{sig['call_wall']:,} ↑ · PW ₹{sig['put_wall']:,} ↓")
 
         # OI Buildup
         pat, meaning, _ = buildups.get(name, ("NEUTRAL", "—", 0))
-        if pat != "NEUTRAL":
-            lines.append(f"📊 *{pat}* — {meaning}")
+        if pat not in ("NEUTRAL", "BOTH ADDING"):
+            lines.append(f"{pat} — {meaning}")
 
-        # Fix 4 — PCR Trend
+        # PCR Trend — only significant ones
         if pcr_trends and name in pcr_trends:
             pcr_t, pcr_m = pcr_trends[name]
-            if pcr_t not in ("NEUTRAL", "STABLE"):
-                lines.append(f"📈 *PCR {pcr_t}* — {pcr_m}")
+            if pcr_t in ("RISING", "FALLING"):
+                lines.append(f"📈 PCR {pcr_t} — {pcr_m}")
 
         # OI Change
         if sig["oi_signal"] != "Neutral":
-            lines.append(f"🔄 OI: {sig['oi_signal']}")
+            lines.append(f"🔄 {sig['oi_signal']}")
 
-        # Top OI changes
-        chgs = top_chg.get(name, [])
-        if chgs:
-            lines.append("*Top OI Changes:*")
-            for c in chgs:
-                lines.append(f"  {c}")
+        # Entry / Target / SL — clean format like Sample 4
+        lines.append(f"\nEntry Price:  ₹{entry}")
+        lines.append(f"Target:       ₹{tgt} ({tgt_lbl}) → *+₹{gain_amt}*")
+        lines.append(f"Stop Loss:    ₹{sl} ({sl_lbl}) → *-₹{loss_amt}*")
+        lines.append(f"Lot Size:     {lot_sz} qty")
+        if session_note:
+            lines.append(session_note)
 
-        # Futures
-        if name in fut_analysis:
-            fa = fut_analysis[name]
+        # /buy command based on band
+        top_score = score
+        late_flag = "L" if is_late else "N"
+        if top_score >= 75:
             lines.append(
-                f"📈 Fut Basis: {fa['basis']:+.0f}pts → {fa['sentiment']}"
+                f"\n🚀 *ONE TAP ORDER:*"
+                f" /buy_{name}_{side}_{strike}_{int(entry*100)}_{late_flag}"
             )
+        elif top_score >= 65:
+            lines.append(
+                f"\n⚠️ *CAUTION ORDER (50% size):*"
+                f" /buy_{name}_{side}_{strike}_{int(entry*100)}_{late_flag}"
+            )
+        else:
+            lines.append(f"\n👀 *WATCH ONLY* — Need score ≥65 to trade")
 
         lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -1516,7 +1607,30 @@ def format_message(results, buildups, top_chg, ping, resp,
         f"CE: *{comp_ce}* {'🟢' if comp_ce>=75 else '🟡' if comp_ce>=55 else '🔴'} · "
         f"PE: *{comp_pe}* {'🟢' if comp_pe>=75 else '🟡' if comp_pe>=55 else '🔴'}"
     )
-    lines.append("\n_OC Radar v6 · Educational only_")
+    # ── BOTTOM SUMMARY — VIX + FUTURES ───────────────────────
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    vix, vc, vcp = vix_data
+    if vix > 0:
+        lvl, _, _ = analyze_vix(vix, vc, vcp)
+        lines.append(f"🌡️ VIX {vix} {lvl} ({vcp:+.1f}%)")
+
+    if fut_analysis:
+        fut_summary = " · ".join([
+            f"{n}: {fa['basis']:+.0f}pts {fa['sentiment'].split()[0]}"
+            for n, fa in fut_analysis.items()
+        ])
+        lines.append(f"📊 Futures: {fut_summary}")
+
+    # Global bias
+    g_summary = format_global(global_data)
+    if g_summary:
+        # Extract just the bias line
+        for l in g_summary.split("\n"):
+            if "Bias:" in l:
+                lines.append(f"🌍 {l.strip()}")
+                break
+
+    lines.append("_OC Radar v7 · Educational only_")
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════
@@ -1534,7 +1648,7 @@ def send_market_open_alert(expiries, global_data):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "⏰ Wait till *9:30 AM* to enter\n"
         "❌ Do NOT trade 9:15–9:30 AM\n"
-        "_OC Radar v6 · Educational only_"
+        "_OC Radar v7 · Educational only_"
     )
     send_telegram(msg)
 
@@ -1552,7 +1666,7 @@ def check_expiry_warning(expiries):
             "⚠️ Exit all positions by *2:30 PM*\n"
             "⚠️ Max Pain pull very strong today\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "_OC Radar v6 · Educational only_"
+            "_OC Radar v7 · Educational only_"
         )
         send_telegram(msg)
 
@@ -1572,7 +1686,7 @@ def send_eod_summary(results, expiries):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Log your trades!\n"
         "✅ Update Dhan token tonight\n"
-        "_OC Radar v6 · Educational only_"
+        "_OC Radar v7 · Educational only_"
     )
     send_telegram(msg)
 
@@ -1680,7 +1794,7 @@ def send_book_profits_alert():
         "✅ Move SL to breakeven on remaining\n"
         "⚠️ No new entries after this\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "_OC Radar v6 · Educational only_"
+        "_OC Radar v7 · Educational only_"
     )
     send_telegram(msg)
 
@@ -1695,7 +1809,7 @@ def send_exit_all_alert(is_expiry=False):
             "🔴 Theta destroying premiums fast\n"
             "🔴 Do NOT hold past 2:30 PM today\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "_OC Radar v6 · Educational only_"
+            "_OC Radar v7 · Educational only_"
         )
     else:
         msg = (
@@ -1706,7 +1820,7 @@ def send_exit_all_alert(is_expiry=False):
             "🔴 No new entries after 2:30 PM\n"
             "✅ Lock in your profits for today\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "_OC Radar v6 · Educational only_"
+            "_OC Radar v7 · Educational only_"
         )
     send_telegram(msg)
 
@@ -1719,7 +1833,7 @@ def send_closing_alert():
         "🔴 Exit everything NOW\n"
         "🔴 Last chance to avoid overnight risk\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "_OC Radar v6 · Educational only_"
+        "_OC Radar v7 · Educational only_"
     )
     send_telegram(msg)
 
@@ -1827,7 +1941,7 @@ def check_partial_booking(results):
                 f"✅ Move SL to breakeven (₹{a['entry']})\n"
                 f"🎯 Hold rest for ₹{a['target_40']} (+40%)\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"_OC Radar v6 · Educational only_"
+                f"_OC Radar v7 · Educational only_"
             )
         elif a["type"] == "TARGET":
             msg = (
@@ -1840,7 +1954,7 @@ def check_partial_booking(results):
                 f"✅ Exit *remaining 50%* NOW\n"
                 f"✅ Lock in full profit\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"_OC Radar v6 · Educational only_"
+                f"_OC Radar v7 · Educational only_"
             )
         else:  # SL
             msg = (
@@ -1854,7 +1968,7 @@ def check_partial_booking(results):
                 f"🔴 Do not average down\n"
                 f"🔴 Wait for next fresh signal\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"_OC Radar v6 · Educational only_"
+                f"_OC Radar v7 · Educational only_"
             )
         send_telegram(msg)
 
@@ -1934,8 +2048,9 @@ def main():
     exit_all_sent        = False
     closing_alert_sent   = False
     results              = {}
-    daily_signals_count  = 0   # Track signals sent today
-    daily_trades         = []  # Track trades for EOD log
+    daily_signals_count  = 0
+    daily_trades         = []
+    global token_generated_today, waiting_for_totp
 
     # Initialize Google Sheets
     print("📊 Connecting to Google Sheets...")
@@ -1966,13 +2081,13 @@ def main():
     # Starts 9:05 AM → stops 3:05 PM IST
     # Pre-market 9:05-9:13 AM + Live 9:13-3:05 PM ✅
     start_time = time.time()
-    MAX_RUNTIME_SECONDS = 6 * 60 * 60  # Exactly 6 hours → 9:05 AM to 3:05 PM IST
+    MAX_RUNTIME_SECONDS = 6 * 60 * 60  # Exactly 6 hours → 9:13 AM to 3:13 PM IST
 
     # ── PRE-MARKET PHASE (9:05-9:13 AM) ──────────────────────
     now_ist = datetime.now(IST)
     t_now   = now_ist.time()
 
-    if t_now < dtime(9, 13):
+    if t_now < dtime(9, 15):  # Wait till market opens
         print("🌅 Pre-market phase starting...")
 
         # Fetch global markets
@@ -2048,7 +2163,7 @@ def main():
         print("✅ Pre-market brief sent!")
 
         # Wait till 9:13 AM
-        while datetime.now(IST).time() < dtime(9, 13):
+        while datetime.now(IST).time() < dtime(9, 15):
             check_telegram_updates()
             time.sleep(10)
 
@@ -2122,7 +2237,7 @@ def main():
             # FIX 2 — Exit all alert at 2:30 PM
             today_str    = datetime.now(IST).strftime("%Y-%m-%d")
             is_expiry_day = any(e == today_str for e in expiries.values())
-            # Exit alert — 2:30 PM on expiry, 3:10 PM on normal day
+            # Exit alert — 2:00 PM on expiry, 3:10 PM on normal day
             exit_time = dtime(14, 30) if is_expiry_day else dtime(15, 10)
             exit_time_end = dtime(14, 34) if is_expiry_day else dtime(15, 14)
             if exit_time <= t <= exit_time_end and not exit_all_sent:
@@ -2137,7 +2252,7 @@ def main():
                 print("⏰ Closing alert sent")
 
             # EOD summary at 3:31 PM
-            if dtime(15, 31) <= t <= dtime(15, 35) and not eod_sent:
+            if dtime(15, 10) <= t <= dtime(15, 14) and not eod_sent:
                 if results:
                     send_eod_summary(results, expiries)
                 # Auto-import trades from Dhan
