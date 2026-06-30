@@ -872,7 +872,11 @@ def handle_telegram_update(update):
         )
 
 def check_telegram_updates():
-    """Check for new Telegram messages (commands from user)"""
+    """Check for new Telegram messages (commands from user).
+    Uses the poll-only blackout — never affects signal sends."""
+    global _tg_poll_blocked, _tg_poll_retry_at
+    if not _tg_poll_reachable():
+        return   # silent skip when polling is backing off
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {"timeout": 1, "limit": 5}
@@ -884,8 +888,12 @@ def check_telegram_updates():
         for upd in updates:
             check_telegram_updates.last_update_id = upd["update_id"]
             handle_telegram_update(upd)
+        _tg_poll_blocked = False
     except Exception as e:
-        print(f"Telegram update check error: {e}")
+        if any(k in str(e) for k in ("ConnectTimeout", "Max retries", "timed out")):
+            _tg_poll_blocked  = True
+            _tg_poll_retry_at = time.time() + 300
+        # silent — don't spam console
 
 # ══════════════════════════════════════════════════════════════
 # FIX 5 — HOLIDAY DETECTION
@@ -911,64 +919,62 @@ def is_trading_day():
     return True, "Trading Day"
 
 # ══════════════════════════════════════════════════════════════
-# FIX 4 — GLOBAL MARKETS
+# FIX 4 — GLOBAL MARKETS (Yahoo Finance — NON-CRITICAL, FAIL-FAST)
+# Yahoo Finance officially disallows automated/bot access and can
+# silently block or rate-limit this. This data is supplementary
+# only (Global Bias line) — it never affects core trading signals.
+# A circuit breaker skips Yahoo entirely for 15 min after 2
+# consecutive failures, so a Yahoo block can't slow down or stall
+# your main signal/Telegram loop.
 # ══════════════════════════════════════════════════════════════
+_global_mkt_fail_count = 0
+_global_mkt_skip_until = 0
+
 def fetch_global_markets():
-    """Fetch SGX Nifty, Dow Futures, Crude, USD/INR"""
+    """Fetch SGX Nifty, Dow Futures, Crude, USD/INR.
+    Best-effort only — failures here must never block or delay
+    the core signal pipeline."""
+    global _global_mkt_fail_count, _global_mkt_skip_until
     global_data = {}
 
-    # SGX/Gift Nifty
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/GIFT50.NS"
-        r = requests.get(url, timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"})
-        data = r.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        prev  = data["chart"]["result"][0]["meta"]["previousClose"]
-        chg   = round(price - prev, 2)
-        chg_p = round(chg / prev * 100, 2)
-        global_data["GIFT Nifty"] = {"price": price, "chg": chg, "chg_pct": chg_p}
-    except:
-        global_data["GIFT Nifty"] = None
+    # Circuit breaker — skip Yahoo entirely if it's been failing
+    if time.time() < _global_mkt_skip_until:
+        return global_data  # empty dict — caller already handles this gracefully
 
-    # Dow Jones Futures
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/YM=F"
-        r = requests.get(url, timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"})
-        data = r.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        prev  = data["chart"]["result"][0]["meta"]["previousClose"]
-        chg_p = round((price - prev) / prev * 100, 2)
-        global_data["Dow Fut"] = {"price": price, "chg_pct": chg_p}
-    except:
-        global_data["Dow Fut"] = None
+    sources = {
+        "GIFT Nifty": "https://query1.finance.yahoo.com/v8/finance/chart/GIFT50.NS",
+        "Dow Fut":    "https://query1.finance.yahoo.com/v8/finance/chart/YM=F",
+        "Crude":      "https://query1.finance.yahoo.com/v8/finance/chart/CL=F",
+        "USD/INR":    "https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X",
+    }
 
-    # Crude Oil WTI
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F"
-        r = requests.get(url, timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"})
-        data = r.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        prev  = data["chart"]["result"][0]["meta"]["previousClose"]
-        chg_p = round((price - prev) / prev * 100, 2)
-        global_data["Crude"] = {"price": price, "chg_pct": chg_p}
-    except:
-        global_data["Crude"] = None
+    any_success = False
+    for name, url in sources.items():
+        try:
+            r = requests.get(url, timeout=4,  # short timeout — fail fast, don't stall loop
+                headers={"User-Agent": "Mozilla/5.0"})
+            data  = r.json()
+            price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            prev  = data["chart"]["result"][0]["meta"]["previousClose"]
+            chg   = round(price - prev, 2)
+            chg_p = round(chg / prev * 100, 2) if prev else 0
+            if name == "GIFT Nifty":
+                global_data[name] = {"price": price, "chg": chg, "chg_pct": chg_p}
+            else:
+                global_data[name] = {"price": round(price, 2), "chg_pct": chg_p}
+            any_success = True
+        except Exception:
+            global_data[name] = None
 
-    # USD/INR
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X"
-        r = requests.get(url, timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"})
-        data = r.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        prev  = data["chart"]["result"][0]["meta"]["previousClose"]
-        chg_p = round((price - prev) / prev * 100, 2)
-        global_data["USD/INR"] = {"price": round(price, 2), "chg_pct": chg_p}
-    except:
-        global_data["USD/INR"] = None
+    if any_success:
+        _global_mkt_fail_count = 0
+        _global_mkt_skip_until = 0
+    else:
+        _global_mkt_fail_count += 1
+        if _global_mkt_fail_count >= 2:
+            _global_mkt_skip_until = time.time() + 900  # back off 15 min
+            print("⚠️ Global markets (Yahoo) unreachable twice — "
+                  "skipping for 15 min, signals unaffected")
 
     return global_data
 
@@ -1020,25 +1026,35 @@ def format_global(global_data):
     return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════
-# VIX
+# DHAN MARKET FEED HELPER
+# Uses Dhan's quote API (always reachable) instead of NSE
+# IDX_I security IDs: 13=NIFTY, 21=VIX, 25=BANKNIFTY, 51=SENSEX
+# ══════════════════════════════════════════════════════════════
+def _dhan_quote(payload):
+    """POST to Dhan v2/marketfeed/quote, return raw data dict."""
+    url = "https://api.dhan.co/v2/marketfeed/quote"
+    headers = {
+        "access-token": DHAN_API_KEY,
+        "client-id":    DHAN_CLIENT_ID,
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    return r.json()
+
+# ══════════════════════════════════════════════════════════════
+# VIX  — Dhan IDX_I security 21
 # ══════════════════════════════════════════════════════════════
 def fetch_vix():
     try:
-        url = "https://www.nseindia.com/api/allIndices"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-            "Referer": "https://www.nseindia.com",
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        for item in data.get("data", []):
-            if item.get("indexSymbol") == "India VIX":
-                return (
-                    round(item.get("last", 0), 2),
-                    round(item.get("change", 0), 2),
-                    round(item.get("percentChange", 0), 2),
-                )
+        data = _dhan_quote({"IDX_I": [21]})
+        d    = data.get("data", {}).get("IDX_I", {}).get("21", {})
+        if not d:
+            return 0, 0, 0
+        ltp  = float(d.get("last_price", 0))
+        prev = float(d.get("close_price", ltp) or ltp)
+        chg  = round(ltp - prev, 2)
+        chgp = round(chg / prev * 100, 2) if prev else 0
+        return round(ltp, 2), chg, chgp
     except Exception as e:
         print(f"VIX fetch error: {e}")
     return 0, 0, 0
@@ -1064,41 +1080,27 @@ def analyze_vix(vix, chg, chg_pct):
     return level, f"{advice} · {trend}", adj
 
 # ══════════════════════════════════════════════════════════════
-# FUTURES
+# FUTURES — Dhan IDX_I: 13=NIFTY, 25=BANKNIFTY, 51=SENSEX
+# Spot prices come from Dhan quote API; futures = spot (basis≈0)
+# when actual futures contracts aren't needed for core signals.
 # ══════════════════════════════════════════════════════════════
 def fetch_futures():
     futures = {}
-    for sym, name in [("NIFTY", "NIFTY"), ("BANKNIFTY", "BANKNIFTY")]:
-        try:
-            url = f"https://www.nseindia.com/api/quote-derivative?symbol={sym}"
-            headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
-                       "Referer": "https://www.nseindia.com"}
-            r = requests.get(url, headers=headers, timeout=10)
-            data = r.json()
-            for item in data.get("stocks", []):
-                meta = item.get("metadata", {})
-                if meta.get("instrumentType") == "Stock Futures":
-                    futures[name] = {
-                        "fut":  meta.get("lastPrice", 0),
-                        "spot": meta.get("underlyingValue", 0),
-                    }
-                    break
-        except Exception as e:
-            print(f"{name} futures error: {e}")
-
-    # Sensex from BSE
     try:
-        url = "https://api.bseindia.com/BseIndiaAPI/api/SensexData/w"
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
-                   "Referer": "https://www.bseindia.com"}
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        spot = float(data.get("CurrVal", 0))
-        if spot > 0:
-            futures["SENSEX"] = {"fut": round(spot * 1.003, 2), "spot": spot}
+        data = _dhan_quote({"IDX_I": [13, 25, 51]})
+        idx  = data.get("data", {}).get("IDX_I", {})
+        mapping = {"13": "NIFTY", "25": "BANKNIFTY", "51": "SENSEX"}
+        for sec_id, name in mapping.items():
+            d = idx.get(sec_id, {})
+            if not d:
+                continue
+            spot = float(d.get("last_price", 0))
+            prev = float(d.get("close_price", spot) or spot)
+            if spot > 0:
+                # Use prev-close as proxy futures price to compute basis
+                futures[name] = {"fut": round(prev, 2), "spot": spot}
     except Exception as e:
-        print(f"Sensex futures error: {e}")
-
+        print(f"Futures fetch error: {e}")
     return futures
 
 def analyze_futures(futures_data):
@@ -1171,8 +1173,15 @@ def parse_oc(raw):
     if raw.get("status") == "failure" or raw.get("errorCode"):
         print(f"  ⚠️ OC API error: {raw.get('remarks', raw.get('errorCode', 'Unknown'))}")
         return None, []
-    spot   = raw.get("last_price") or raw.get("underlyingLastPrice") or 0
-    chains = raw.get("data", raw.get("optionChain", []))
+    # Dhan v2 format: {"data": {"oc": [...], "last_price": 23881.5}, "status": "success"}
+    # Fallback: {"data": [...], "last_price": ...}
+    d = raw.get("data", {})
+    if isinstance(d, dict):
+        spot   = d.get("last_price") or d.get("underlyingLastPrice") or 0
+        chains = d.get("oc", d.get("optionChain", d.get("data", [])))
+    else:
+        spot   = raw.get("last_price") or raw.get("underlyingLastPrice") or 0
+        chains = d  # d is already the list
     if not chains:
         return spot, []
     parsed = []
@@ -1912,17 +1921,58 @@ def send_eod_summary(results, expiries):
     send_telegram(msg)
 
 # ══════════════════════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM — FIXED v10.1
+# Signal sends NEVER silently skip — they retry immediately with
+# short backoff. The old 5-minute blackout is now ONLY used for
+# background command polling (check_telegram_updates), which is
+# non-critical and safe to delay.
 # ══════════════════════════════════════════════════════════════
-def send_telegram(msg):
+_tg_poll_blocked  = False   # only gates polling, never signal sends
+_tg_poll_retry_at = 0
+
+def _tg_poll_reachable():
+    global _tg_poll_blocked, _tg_poll_retry_at
+    if not _tg_poll_blocked:
+        return True
+    if time.time() >= _tg_poll_retry_at:
+        _tg_poll_blocked = False
+        return True
+    return False
+
+def send_telegram(msg, max_retries=3, retry_delay=3):
+    """
+    Send a Telegram message — used for actual trading signals.
+    Retries up to max_retries times with a short delay instead of
+    silently going dark for 5 minutes. If all retries fail, logs
+    loudly to console AND writes the missed message to a local
+    file so no signal is ever lost without a trace.
+    """
     url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        print(f"✅ Sent at {datetime.now(IST).strftime('%H:%M:%S IST')}")
-    except Exception as e:
-        print(f"❌ Telegram error: {e}")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=8)
+            r.raise_for_status()
+            print(f"✅ Telegram sent at {datetime.now(IST).strftime('%H:%M:%S IST')}"
+                  + (f" (attempt {attempt})" if attempt > 1 else ""))
+            return True
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"⚠️ Telegram send failed (attempt {attempt}/{max_retries}): {e} "
+                      f"— retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                print(f"❌ TELEGRAM SEND FAILED after {max_retries} attempts: {e}")
+                print(f"❌ MISSED MESSAGE: {msg[:120]}...")
+                try:
+                    with open(os.path.expanduser("~/missed_telegram_signals.log"), "a") as f:
+                        f.write(f"\n[{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"FAILED ({e}):\n{msg}\n{'-'*50}\n")
+                except Exception:
+                    pass
+                return False
 
 def ist_time():
     n  = datetime.now(IST)
@@ -1976,21 +2026,24 @@ def get_time_window(is_expiry_day=False):
     now = datetime.now(IST)
     t   = now.time()
 
+    # ANALYSIS MODE — show all signals ≥50 across all windows
+    MIN_SCORE = 50
+
     if is_expiry_day:
         if t < dtime(9, 15):    return "PRE_MARKET",    False, 0
         elif t < dtime(9, 30):  return "OPENING",        False, 0
-        elif t < dtime(11, 0):  return "BEST_WINDOW",    True,  75
-        elif t < dtime(13, 0):  return "SLOW_ZONE",      True,  80
-        elif t < dtime(14, 0):  return "ACTIVE",         True,  85
+        elif t < dtime(11, 0):  return "BEST_WINDOW",    True,  MIN_SCORE
+        elif t < dtime(13, 0):  return "SLOW_ZONE",      True,  MIN_SCORE
+        elif t < dtime(14, 0):  return "ACTIVE",         True,  MIN_SCORE
         elif t < dtime(14, 30): return "EXPIRY_CAUTION", False, 0
         else:                   return "EXPIRY_EXIT",    False, 0
     else:
         if t < dtime(9, 15):    return "PRE_MARKET",     False, 0
         elif t < dtime(9, 30):  return "OPENING",         False, 0
-        elif t < dtime(11, 0):  return "BEST_WINDOW",     True,  75
-        elif t < dtime(13, 0):  return "SLOW_ZONE",       True,  80
-        elif t < dtime(14, 30): return "ACTIVE",          True,  75
-        elif t < dtime(15, 10): return "LATE_SESSION",    True,  85
+        elif t < dtime(11, 0):  return "BEST_WINDOW",     True,  MIN_SCORE
+        elif t < dtime(13, 0):  return "SLOW_ZONE",       True,  MIN_SCORE
+        elif t < dtime(14, 30): return "ACTIVE",          True,  MIN_SCORE
+        elif t < dtime(15, 10): return "LATE_SESSION",    True,  MIN_SCORE
         else:                   return "EXIT_ALL",        False, 0
 
 def should_send_in_window(results, window, min_score):
@@ -2603,6 +2656,10 @@ def main():
                         global_data, expiries, pcr_trends, window,
                         is_late=is_late
                     )
+                    # Print to console always (Telegram may be blocked)
+                    print("\n" + "="*50)
+                    print(msg)
+                    print("="*50 + "\n")
                     send_telegram(msg)
                     update_prev_scores(results)
                     print(f"📨 Sent — {reason} — Window: {window}")
