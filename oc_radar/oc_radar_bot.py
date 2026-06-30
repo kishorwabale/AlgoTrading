@@ -1814,19 +1814,11 @@ def format_message(results, buildups, top_chg, ping, resp,
         if session_note:
             lines.append(session_note)
 
-        # /buy command based on band
-        top_score = score
-        late_flag = "L" if is_late else "N"
-        if top_score >= 75:
-            lines.append(
-                f"\n🚀 *ONE TAP ORDER:*"
-                f" /buy_{name}_{side}_{strike}_{int(entry*100)}_{late_flag}"
-            )
-        elif top_score >= 65:
-            lines.append(
-                f"\n⚠️ *CAUTION ORDER (50% size):*"
-                f" /buy_{name}_{side}_{strike}_{int(entry*100)}_{late_flag}"
-            )
+        # Trade band indicator — no /buy command in message (manual entry only)
+        if score >= 75:
+            lines.append(f"\n✅ *TRADE* — Full size")
+        elif score >= 65:
+            lines.append(f"\n⚠️ *CAUTION* — 50% size only")
         else:
             lines.append(f"\n👀 *WATCH ONLY* — Need score ≥65 to trade")
 
