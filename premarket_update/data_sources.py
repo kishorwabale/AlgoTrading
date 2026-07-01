@@ -88,18 +88,26 @@ def _get_dhan_token():
     if not (DHAN_CLIENT_ID and DHAN_PIN and DHAN_TOTP_SECRET):
         raise RuntimeError("DHAN_CLIENT_ID / DHAN_PIN / DHAN_TOTP_SECRET not set")
 
-    totp = _generate_totp_code(DHAN_TOTP_SECRET)
-    url = (
-        "https://auth.dhan.co/app/generateAccessToken"
-        f"?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp}"
-    )
-    r = requests.post(url, timeout=10)
-    data = r.json()
-    token = data.get("accessToken", "")
-    if not token:
-        raise RuntimeError(f"Dhan token generation failed: {data.get('remarks', data)}")
-    _dhan_token_cache["token"] = token
-    return token
+    last_error = None
+    for attempt in range(2):
+        try:
+            totp = _generate_totp_code(DHAN_TOTP_SECRET)
+            url = (
+                "https://auth.dhan.co/app/generateAccessToken"
+                f"?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp}"
+            )
+            r = requests.post(url, timeout=25)
+            data = r.json()
+            token = data.get("accessToken", "")
+            if not token:
+                raise RuntimeError(f"Dhan token generation failed: {data.get('remarks', data)}")
+            _dhan_token_cache["token"] = token
+            return token
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                time.sleep(31)  # TOTP window is 30s — wait for a fresh code before retrying
+    raise last_error
 
 
 def _dhan_quote(payload):
@@ -524,7 +532,4 @@ def build_dashboard_data():
         "nifty": get_index_snapshot("NIFTY"),
         "vix": get_india_vix(),
         "pcr": get_pcr("NIFTY"),
-        "gift_nifty": get_gift_nifty(),
-        "fii": get_fii_positioning(),
-        "global": get_global_markets(),
-    }
+   
