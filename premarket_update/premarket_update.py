@@ -32,32 +32,32 @@ def fmt_pct(val):
 def build_message():
     d = ds.build_dashboard_data()
     lines = []
-    lines.append("📊 *PRE-MARKET RADAR*")
-    lines.append(f"_{d['generated_at']}_")
+    lines.append("📊 <b>PRE-MARKET RADAR</b>")
+    lines.append(f"<i>{d['generated_at']}</i>")
     lines.append("")
 
     # Nifty spot
     n = d["nifty"]
     if n.get("ok"):
-        lines.append(f"*NIFTY 50:* {n['last']:,.2f}  {fmt_pct(n['pct_change'])}")
+        lines.append(f"<b>NIFTY 50:</b> {n['last']:,.2f}  {fmt_pct(n['pct_change'])}")
         lines.append(f"  L: {n['day_low']:,.0f}  H: {n['day_high']:,.0f}")
     else:
-        lines.append("*NIFTY 50:* source offline")
+        lines.append("<b>NIFTY 50:</b> source offline")
 
     # VIX
     v = d["vix"]
     if v.get("ok"):
-        lines.append(f"*India VIX:* {v['last']}  {fmt_pct(v['pct_change'])}")
+        lines.append(f"<b>India VIX:</b> {v['last']}  {fmt_pct(v['pct_change'])}")
     else:
-        lines.append("*India VIX:* source offline")
+        lines.append("<b>India VIX:</b> source offline")
 
     # PCR
     p = d["pcr"]
     if p.get("ok"):
         sentiment = "BULLISH" if p["pcr"] >= 1 else "BEARISH"
-        lines.append(f"*PCR:* {p['pcr']}  ({sentiment})")
+        lines.append(f"<b>PCR:</b> {p['pcr']}  ({sentiment})")
     else:
-        lines.append("*PCR:* source offline")
+        lines.append("<b>PCR:</b> source offline")
 
     lines.append("")
 
@@ -66,17 +66,17 @@ def build_message():
     if g.get("ok"):
         gap = g["gap_points"]
         sign = "+" if gap >= 0 else ""
-        lines.append(f"*Gift Nifty Gap:* {sign}{gap} pts")
+        lines.append(f"<b>Gift Nifty Gap:</b> {sign}{gap} pts")
     else:
-        lines.append("*Gift Nifty Gap:* not set — update gift_nifty.json")
+        lines.append("<b>Gift Nifty Gap:</b> not set - update gift_nifty.json")
 
     # FII
     f = d["fii"]
     if f.get("ok"):
-        lines.append(f"*FII Index Futures:* {f['long_pct']}% long / {f['short_pct']}% short")
+        lines.append(f"<b>FII Index Futures:</b> {f['long_pct']}% long / {f['short_pct']}% short")
         lines.append(f"  Net: {f['net_contracts']:,} contracts (as of {f['as_of']})")
     else:
-        lines.append("*FII positioning:* source offline")
+        lines.append("<b>FII positioning:</b> source offline")
 
     # Global markets
     if d["global"].get("ok"):
@@ -88,7 +88,7 @@ def build_message():
                 for k, v in g[group_key].items() if v.get("ok")
             ]
             if entries:
-                lines.append(f"*{group_label}:* " + "  ".join(entries))
+                lines.append(f"<b>{group_label}:</b> " + "  ".join(entries))
 
     return "\n".join(lines)
 
@@ -104,7 +104,7 @@ def send_telegram(message):
     resp = requests.post(url, data={
         "chat_id": chat_id,
         "text": message,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }, timeout=10)
 
     if resp.status_code != 200:
