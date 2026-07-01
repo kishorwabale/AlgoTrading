@@ -138,14 +138,31 @@ def _nse_session(referer=None):
     return s
 
 
+_quote_cache = {}
+
+
+def _get_indices_quote():
+    """
+    Fetch Nifty + VIX (+ BankNifty/Sensex, useful later) in a single Dhan
+    quote call instead of separate calls per index — Dhan rate-limits rapid
+    successive requests to marketfeed/quote, and two calls back-to-back was
+    triggering a 429.
+    """
+    if _quote_cache:
+        return _quote_cache
+    data = _dhan_quote({"IDX_I": list(DHAN_SEC_IDS.values())})
+    idx = data.get("data", {}).get("IDX_I", {})
+    for name, sec_id in DHAN_SEC_IDS.items():
+        _quote_cache[name] = idx.get(str(sec_id), {})
+    return _quote_cache
+
+
 # ---------------------------------------------------------------------------
 # Index spot — Dhan quote API
 # ---------------------------------------------------------------------------
 def get_index_snapshot(symbol="NIFTY"):
     try:
-        sec_id = DHAN_SEC_IDS[symbol]
-        data = _dhan_quote({"IDX_I": [sec_id]})
-        d = data.get("data", {}).get("IDX_I", {}).get(str(sec_id), {})
+        d = _get_indices_quote().get(symbol, {})
         if not d:
             return {"symbol": symbol, "ok": False, "error": "empty response from Dhan"}
 
@@ -167,8 +184,7 @@ def get_index_snapshot(symbol="NIFTY"):
 
 def get_india_vix():
     try:
-        data = _dhan_quote({"IDX_I": [DHAN_SEC_IDS["VIX"]]})
-        d = data.get("data", {}).get("IDX_I", {}).get(str(DHAN_SEC_IDS["VIX"]), {})
+        d = _get_indices_quote().get("VIX", {})
         if not d:
             return {"ok": False, "error": "empty response from Dhan"}
         last = float(d.get("last_price", 0))
@@ -200,6 +216,7 @@ def get_pcr(symbol="NIFTY"):
     oc_radar_bot.py already uses for its signal engine).
     """
     try:
+        time.sleep(1)  # small buffer after the quote call, avoid stacking rate limit
         scrip = DHAN_SEC_IDS[symbol]
         expiry = _get_next_expiry(scrip)
         data = _dhan_post(
