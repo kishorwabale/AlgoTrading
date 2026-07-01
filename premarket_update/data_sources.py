@@ -1,30 +1,43 @@
 """
 Data sources for the Pre-Market Dashboard.
 
-Each function returns a plain dict so the Flask route can just dump it into
-the template. Every fetcher is wrapped in try/except and falls back to None /
-cached values so one dead source never takes down the whole dashboard.
+Each function returns a plain dict so the Flask route/Telegram script can
+just use it. Every fetcher is wrapped in try/except and falls back to
+None/error values so one dead source never takes down the whole report.
 
-WIRING NOTES (read before running live):
-- Nifty/BankNifty/Sensex spot + India VIX + PCR: pull from your existing
-  Dhan MCP session (same one OC Radar uses). Swap `get_index_snapshot()`
-  and `get_pcr()` to call your Dhan client instead of the stubs below.
-- FII/DII derivatives stats: NSE's own site (nseindia.com/api/...) requires
-  a warmed-up session (cookies from hitting the homepage first) or you'll
-  get 401s. `_nse_session()` handles that.
-- Gift Nifty: NOT an NSE product (it's traded on NSE IX, Gujarat GIFT City).
-  There's no clean public JSON API for it. Two practical options:
-    1. Scrape a site that publishes it (moneycontrol/investing.com) - fragile,
-       breaks when they change markup.
-    2. Enter it manually each morning (takes 5 seconds, zero maintenance).
-  Default here is manual entry via a small JSON file (gift_nifty.json) you
-  update before market open, since Kishor is already at his desk pre-market.
-- US markets / Commodities / Asian markets: yfinance is the path of least
-  resistance (no key, decent reliability for index-level data).
+WIRING NOTES:
+- Nifty/BankNifty/Sensex spot + India VIX + PCR go through Dhan's own
+  quote/option-chain API instead of scraping NSE's website — same pattern
+  oc_radar_bot.py already uses. NSE's option-chain and stock-indices
+  endpoints are their most heavily bot-protected pages and block cloud IPs
+  (GitHub Actions included) with disguised 404s. Dhan is a paid data feed
+  with no such wall.
+  Requires DHAN_CLIENT_ID, DHAN_PIN, DHAN_TOTP_SECRET env vars — same ones
+  already set as repo secrets for oc_radar_bot.yml. A fresh access token is
+  generated via TOTP on every run (no manual login, no session to manage).
+- FII/DII derivatives stats: NSE's daily "Participant wise Open Interest"
+  archive CSV (a different subdomain, archives.nseindia.com, with much
+  weaker bot protection than the main site's API). Has held up fine from
+  CI so far.
+- Gift Nifty: NOT an NSE product (it's traded on NSE IX, Gujarat GIFT
+  City). There's no clean public JSON API for it, so it's manual entry via
+  gift_nifty.json — update it each morning before market open.
+- Global markets (US/commodities/Asia): uses Yahoo's v8/finance/chart
+  endpoint directly (same one oc_radar_bot.py's fetch_global_markets()
+  uses), not the yfinance library — that endpoint doesn't need the
+  cookie/crumb auth that's been breaking yfinance lately. Still
+  best-effort; if Yahoo has a bad day, the section is just skipped.
 """
 
+import base64
+import csv
+import hashlib
+import hmac
+import io
 import json
 import os
+import struct
+import time
 from datetime import datetime, timedelta
 
 import requests
@@ -40,15 +53,82 @@ NSE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID", "")
+DHAN_PIN = os.environ.get("DHAN_PIN", "")
+DHAN_TOTP_SECRET = os.environ.get("DHAN_TOTP_SECRET", "")
+
+# Dhan IDX_I security IDs (same as oc_radar_bot.py)
+DHAN_SEC_IDS = {"NIFTY": 13, "VIX": 21, "BANKNIFTY": 25, "SENSEX": 51}
+
+_dhan_token_cache = {"token": None}
+
+
+# ---------------------------------------------------------------------------
+# Dhan auth — generate a fresh access token via TOTP, same as oc_radar_bot.py
+# ---------------------------------------------------------------------------
+def _generate_totp_code(secret):
+    secret = secret.upper().replace(" ", "")
+    padding = len(secret) % 8
+    if padding:
+        secret += "=" * (8 - padding)
+    key = base64.b32decode(secret)
+    t = int(time.time()) // 30
+    msg = struct.pack(">Q", t)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = h[-1] & 0x0F
+    code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(code % 1000000).zfill(6)
+
+
+def _get_dhan_token():
+    """Cached-for-this-run Dhan access token, generated via TOTP on first call."""
+    if _dhan_token_cache["token"]:
+        return _dhan_token_cache["token"]
+
+    if not (DHAN_CLIENT_ID and DHAN_PIN and DHAN_TOTP_SECRET):
+        raise RuntimeError("DHAN_CLIENT_ID / DHAN_PIN / DHAN_TOTP_SECRET not set")
+
+    totp = _generate_totp_code(DHAN_TOTP_SECRET)
+    url = (
+        "https://auth.dhan.co/app/generateAccessToken"
+        f"?dhanClientId={DHAN_CLIENT_ID}&pin={DHAN_PIN}&totp={totp}"
+    )
+    r = requests.post(url, timeout=10)
+    data = r.json()
+    token = data.get("accessToken", "")
+    if not token:
+        raise RuntimeError(f"Dhan token generation failed: {data.get('remarks', data)}")
+    _dhan_token_cache["token"] = token
+    return token
+
+
+def _dhan_quote(payload):
+    token = _get_dhan_token()
+    url = "https://api.dhan.co/v2/marketfeed/quote"
+    headers = {
+        "access-token": token,
+        "client-id": DHAN_CLIENT_ID,
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def _dhan_post(url, payload):
+    token = _get_dhan_token()
+    headers = {
+        "access-token": token,
+        "client-id": DHAN_CLIENT_ID,
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
 
 def _nse_session(referer=None):
-    """
-    NSE blocks bare requests; you need cookies from a homepage hit first.
-    Some endpoints (equity-stockIndices, option-chain-indices) additionally
-    check the Referer header and reject requests that don't look like they
-    came from browsing the matching page on nseindia.com - so we optionally
-    warm up on that specific page too.
-    """
+    """NSE blocks bare requests; you need cookies from a homepage hit first."""
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
     s.get("https://www.nseindia.com", timeout=5)
@@ -59,28 +139,26 @@ def _nse_session(referer=None):
 
 
 # ---------------------------------------------------------------------------
-# Index spot / VIX / PCR  -> replace body with Dhan MCP calls
+# Index spot — Dhan quote API
 # ---------------------------------------------------------------------------
 def get_index_snapshot(symbol="NIFTY"):
-    """
-    Returns spot price, % change, day low/high, 1-month trend series.
-    TODO: replace with Dhan quote + historical candle call (same pattern as
-    OC Radar's option chain fetch, just on the index instead of the chain).
-    """
     try:
-        s = _nse_session(referer="https://www.nseindia.com/market-data/live-equity-market")
-        r = s.get(
-            f"https://www.nseindia.com/api/equity-stockIndices?index={'NIFTY%2050' if symbol=='NIFTY' else symbol}",
-            timeout=5,
-        )
-        r.raise_for_status()
-        data = r.json()["data"][0]
+        sec_id = DHAN_SEC_IDS[symbol]
+        data = _dhan_quote({"IDX_I": [sec_id]})
+        d = data.get("data", {}).get("IDX_I", {}).get(str(sec_id), {})
+        if not d:
+            return {"symbol": symbol, "ok": False, "error": "empty response from Dhan"}
+
+        last = float(d.get("last_price", 0))
+        ohlc = d.get("ohlc", {}) or {}
+        prev_close = float(ohlc.get("close") or d.get("close_price") or last)
+        pct_change = round(100 * (last - prev_close) / prev_close, 2) if prev_close else 0
         return {
             "symbol": symbol,
-            "last": data.get("lastPrice"),
-            "pct_change": data.get("pChange"),
-            "day_low": data.get("dayLow"),
-            "day_high": data.get("dayHigh"),
+            "last": last,
+            "pct_change": pct_change,
+            "day_low": float(ohlc.get("low") or last),
+            "day_high": float(ohlc.get("high") or last),
             "ok": True,
         }
     except Exception as e:
@@ -89,69 +167,79 @@ def get_index_snapshot(symbol="NIFTY"):
 
 def get_india_vix():
     try:
-        s = _nse_session()
-        r = s.get("https://www.nseindia.com/api/allIndices", timeout=5)
-        r.raise_for_status()
-        for row in r.json().get("data", []):
-            if row.get("index") == "INDIA VIX":
-                return {
-                    "last": row.get("last"),
-                    "pct_change": row.get("percentChange"),
-                    "ok": True,
-                }
-        return {"ok": False, "error": "VIX row not found"}
+        data = _dhan_quote({"IDX_I": [DHAN_SEC_IDS["VIX"]]})
+        d = data.get("data", {}).get("IDX_I", {}).get(str(DHAN_SEC_IDS["VIX"]), {})
+        if not d:
+            return {"ok": False, "error": "empty response from Dhan"}
+        last = float(d.get("last_price", 0))
+        ohlc = d.get("ohlc", {}) or {}
+        prev_close = float(ohlc.get("close") or d.get("close_price") or last)
+        pct_change = round(100 * (last - prev_close) / prev_close, 2) if prev_close else 0
+        return {"last": round(last, 2), "pct_change": pct_change, "ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _get_next_expiry(scrip, seg="IDX_I"):
+    """Nearest upcoming expiry for the given underlying, via Dhan's expirylist."""
+    data = _dhan_post(
+        "https://api.dhan.co/v2/optionchain/expirylist",
+        {"UnderlyingScrip": scrip, "UnderlyingSeg": seg},
+    )
+    expiries = data.get("data", [])
+    today = datetime.now().strftime("%Y-%m-%d")
+    upcoming = sorted(e for e in expiries if e >= today)
+    if not upcoming:
+        raise ValueError("no upcoming expiry returned by Dhan")
+    return upcoming[0]
 
 
 def get_pcr(symbol="NIFTY"):
     """
-    Put-Call ratio by OI. TODO: point this at the same option-chain object
-    OC Radar already builds per cycle instead of hitting NSE directly -
-    you already compute PCR there, just import/reuse it.
+    Put-Call ratio by total OI, via Dhan's option-chain API (same one
+    oc_radar_bot.py already uses for its signal engine).
     """
     try:
-        s = _nse_session(referer=f"https://www.nseindia.com/option-chain")
-        r = s.get(
-            f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
-            timeout=5,
+        scrip = DHAN_SEC_IDS[symbol]
+        expiry = _get_next_expiry(scrip)
+        data = _dhan_post(
+            "https://api.dhan.co/v2/optionchain",
+            {"UnderlyingScrip": scrip, "UnderlyingSeg": "IDX_I", "Expiry": expiry},
         )
-        r.raise_for_status()
-        data = r.json()["records"]["data"]
-        total_ce_oi = sum(d.get("CE", {}).get("openInterest", 0) for d in data if "CE" in d)
-        total_pe_oi = sum(d.get("PE", {}).get("openInterest", 0) for d in data if "PE" in d)
-        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi else None
-        return {"pcr": pcr, "ok": pcr is not None}
+        chains = data.get("data", {}).get("oc", {})
+        if not chains:
+            return {"ok": False, "error": "no option chain data returned"}
+
+        total_ce_oi = 0
+        total_pe_oi = 0
+        for strike_row in chains.values():
+            ce = strike_row.get("ce", {}) or {}
+            pe = strike_row.get("pe", {}) or {}
+            total_ce_oi += ce.get("oi", 0) or 0
+            total_pe_oi += pe.get("oi", 0) or 0
+
+        if not total_ce_oi:
+            return {"ok": False, "error": "zero call OI, can't compute PCR"}
+        pcr = round(total_pe_oi / total_ce_oi, 2)
+        return {"pcr": pcr, "ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
-# FII derivative positioning - real NSE endpoint
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# FII derivative positioning - real NSE endpoint
+# FII derivative positioning - NSE archive CSV
 # ---------------------------------------------------------------------------
 def get_fii_positioning():
     """
-    Index Futures Long vs Short % for FIIs — this is the "17% long / 83%
-    short" style gauge VRD-style reports show. It is NOT the cash market
-    buy/sell figure (that's a different, unrelated number).
+    Index Futures Long vs Short % for FIIs — the "17% long / 83% short"
+    style gauge VRD-style reports show.
 
     Source: NSE's daily "Participant wise Open Interest" archive CSV —
       https://archives.nseindia.com/content/nsccl/fao_participant_oi_DDMMYYYY.csv
-    Published once per day after market close, for that day's session. So
-    pre-market, "today's" file doesn't exist yet — we want the most recent
-    *available* file, which is yesterday's close (or the last trading day
-    if today is a weekend/holiday). We walk back up to 7 calendar days to
-    find the latest published file.
-
-    CSV columns of interest for the FII row:
-      Future Index Long, Future Index Short  (contracts, index futures only)
+    Published once per day after market close. Pre-market, "today's" file
+    doesn't exist yet, so we want the most recent *available* file — walk
+    back up to 7 calendar days to find it.
     """
-    import csv
-    import io
-
     s = _nse_session()
 
     for days_back in range(0, 8):
@@ -160,7 +248,7 @@ def get_fii_positioning():
         try:
             r = s.get(url, timeout=5)
             if r.status_code != 200 or "Client Type" not in r.text:
-                continue  # not published for this date (weekend/holiday/not yet available)
+                continue
 
             reader = csv.reader(io.StringIO(r.text))
             rows = list(reader)
@@ -217,50 +305,33 @@ def set_gift_nifty(gap_points):
 
 
 # ---------------------------------------------------------------------------
-# Global markets - Stooq (no auth needed)
+# Global markets - Yahoo v8/finance/chart (same endpoint oc_radar_bot.py uses)
 # ---------------------------------------------------------------------------
-# NOTE: yfinance was tried first but Yahoo Finance actively rate-limits/blocks
-# requests from cloud datacenter IPs (including GitHub Actions runners) with
-# 429s and broken cookie/crumb auth - this is a widespread, ongoing issue,
-# not something fixable with a version bump. Stooq's plain CSV endpoint has
-# no such auth layer and works reliably from CI runners.
-STOOQ_TICKERS = {
-    "us": {"Dow Jones": "^dji", "S&P 500": "^spx", "Nasdaq": "^ndq"},
-    "commodities": {"Gold": "xauusd", "Brent Oil": "brn.f", "USD/INR": "usdinr"},
-    "asia": {"Nikkei": "^nkx", "Hang Seng": "^hsi", "Shanghai": "^shc"},
+YAHOO_TICKERS = {
+    "us": {"Dow Jones": "^DJI", "S&P 500": "^GSPC", "Nasdaq": "^IXIC"},
+    "commodities": {"Gold": "GC=F", "Brent Oil": "BZ=F", "USD/INR": "USDINR=X"},
+    "asia": {"Nikkei": "^N225", "Hang Seng": "^HSI", "Shanghai": "000001.SS"},
 }
 
 
-def _stooq_pct_change(symbol):
-    """Fetch last ~5 sessions of daily closes from Stooq, return latest % change."""
-    import csv
-    import io
-
-    end = datetime.now()
-    start = end - timedelta(days=10)
-    url = (
-        f"https://stooq.com/q/d/l/?s={symbol}&d1={start.strftime('%Y%m%d')}"
-        f"&d2={end.strftime('%Y%m%d')}&i=d"
-    )
-    r = requests.get(url, timeout=5)
+def _yahoo_pct_change(symbol):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    r = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
-    reader = csv.DictReader(io.StringIO(r.text))
-    rows = [row for row in reader if row.get("Close")]
-    if len(rows) < 2:
-        raise ValueError(f"not enough data for {symbol}")
-    prev_close = float(rows[-2]["Close"])
-    last_close = float(rows[-1]["Close"])
-    return round(100 * (last_close - prev_close) / prev_close, 2)
+    meta = r.json()["chart"]["result"][0]["meta"]
+    price = meta["regularMarketPrice"]
+    prev = meta["previousClose"]
+    return round(100 * (price - prev) / prev, 2) if prev else 0
 
 
 def get_global_markets():
     out = {}
     any_ok = False
-    for group, tickers in STOOQ_TICKERS.items():
+    for group, tickers in YAHOO_TICKERS.items():
         out[group] = {}
         for name, symbol in tickers.items():
             try:
-                pct = _stooq_pct_change(symbol)
+                pct = _yahoo_pct_change(symbol)
                 out[group][name] = {"pct_change": pct, "ok": True}
                 any_ok = True
             except Exception as e:
@@ -269,7 +340,7 @@ def get_global_markets():
 
 
 def build_dashboard_data():
-    """Single entry point the Flask route calls."""
+    """Single entry point the Flask route / Telegram script calls."""
     return {
         "generated_at": datetime.now().strftime("%A, %d %b %Y %H:%M"),
         "nifty": get_index_snapshot("NIFTY"),
@@ -278,5 +349,5 @@ def build_dashboard_data():
         "gift_nifty": get_gift_nifty(),
         "fii": get_fii_positioning(),
         "global": get_global_markets(),
-  }
+    }
   
