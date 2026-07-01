@@ -532,4 +532,7 @@ def build_dashboard_data():
         "nifty": get_index_snapshot("NIFTY"),
         "vix": get_india_vix(),
         "pcr": get_pcr("NIFTY"),
-   
+        "gift_nifty": get_gift_nifty(),
+        "fii": get_fii_positioning(),
+        "global": get_global_markets(),
+    }
