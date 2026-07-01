@@ -90,7 +90,7 @@ def build_message():
     d = ds.build_dashboard_data()
 
     # Debug: raw error details for any failed source (Actions logs only)
-    for key in ("nifty", "vix", "pcr", "fii", "gift_nifty"):
+    for key in ("nifty", "vix", "pcr", "fii", "gift_nifty", "futures_preopen"):
         if not d[key].get("ok"):
             print(f"DEBUG [{key}] failed: {d[key].get('error')}")
     if not d["global"].get("ok"):
@@ -147,6 +147,12 @@ def build_message():
         lines.append(f"Net: {f['net_contracts']:,} contracts (as of {f['as_of']})")
     else:
         lines.append("FII (Fut)   source offline")
+
+    fp = d.get("futures_preopen", {})
+    if fp.get("ok"):
+        gap = fp["gap_points"]
+        sign = "+" if gap >= 0 else ""
+        lines.append(f"Nifty Fut   {fp['futures_price']:,.2f}  (implied gap {sign}{gap} pts) <i>[testing]</i>")
 
     # ── Global cues ──────────────────────────────────────
     if d["global"].get("ok"):
