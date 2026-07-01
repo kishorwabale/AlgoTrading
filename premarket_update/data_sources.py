@@ -460,11 +460,15 @@ def _get_nifty_futures_security_id():
         ).upper()
         expiry = row.get("SEM_EXPIRY_DATE") or row.get("EXPIRY_DATE") or ""
         sec_id = row.get("SEM_SMST_SECURITY_ID") or row.get("SECURITY_ID")
+
+        # Exact match on the leading token only — "NIFTY" contains-check
+        # was wrongly matching MIDCPNIFTY, NIFTYNXT50, NIFTYIT etc, all of
+        # which include "NIFTY" as a substring but are different underlyings
+        # trading at very different levels (14,595 vs Nifty's ~24,000).
+        symbol_prefix = symbol.replace("_", "-").split("-")[0]
         if (
             instrument == "FUTIDX"
-            and "NIFTY" in symbol
-            and "BANK" not in symbol
-            and "FIN" not in symbol
+            and symbol_prefix == "NIFTY"
             and expiry >= today
             and sec_id
         ):
@@ -512,6 +516,18 @@ def get_futures_preopen():
         prev_close = float(nse_row.get("previousClose", 0) or 0)
         if not prev_close:
             return {"ok": False, "error": "couldn't get NIFTY previous close for gap calc"}
+
+        # Sanity check — if these are more than ~10% apart, we almost
+        # certainly grabbed the wrong contract (this is how the
+        # MIDCPNIFTY mismatch surfaced) rather than a real market move.
+        if abs(fut_price - prev_close) > 0.10 * prev_close:
+            return {
+                "ok": False,
+                "error": (
+                    f"futures_price {fut_price} implausibly far from prev_close "
+                    f"{prev_close} (security_id={sec_id}) — likely wrong contract matched"
+                ),
+            }
 
         gap = round(fut_price - prev_close, 2)
         return {
