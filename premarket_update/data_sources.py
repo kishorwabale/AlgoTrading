@@ -141,41 +141,59 @@ def _nse_session(referer=None):
 _quote_cache = {}
 
 
-def _get_indices_quote():
+def _get_nse_indices():
     """
-    Fetch Nifty + VIX (+ BankNifty/Sensex, useful later) in a single Dhan
-    quote call instead of separate calls per index — Dhan rate-limits rapid
-    successive requests to marketfeed/quote, and two calls back-to-back was
-    triggering a 429.
+    NSE's allIndices endpoint already proved reliable from CI (this is how
+    VIX worked even before the Dhan swap) and gives a correct percentChange
+    field directly for every listed index, Nifty 50 included. Dhan's
+    ohlc.close field on IDX_I instruments appears to just mirror last_price
+    rather than holding a genuine previous-day close (both Nifty and VIX
+    showed exactly 0.0% simultaneously, which pointed at the field itself
+    rather than an actual flat market) - so spot/VIX % change comes from
+    here instead, while Dhan is still used for PCR where it's needed.
     """
     if _quote_cache:
         return _quote_cache
-    data = _dhan_quote({"IDX_I": list(DHAN_SEC_IDS.values())})
-    idx = data.get("data", {}).get("IDX_I", {})
-    for name, sec_id in DHAN_SEC_IDS.items():
-        _quote_cache[name] = idx.get(str(sec_id), {})
+    s = _nse_session()
+    r = s.get("https://www.nseindia.com/api/allIndices", timeout=5)
+    r.raise_for_status()
+    for row in r.json().get("data", []):
+        _quote_cache[row.get("index", "")] = row
     return _quote_cache
 
 
 # ---------------------------------------------------------------------------
-# Index spot — Dhan quote API
+# Index spot — NSE allIndices (day_low/day_high still from Dhan quote)
 # ---------------------------------------------------------------------------
 def get_index_snapshot(symbol="NIFTY"):
+    nse_name = "NIFTY 50" if symbol == "NIFTY" else symbol
     try:
-        d = _get_indices_quote().get(symbol, {})
-        if not d:
-            return {"symbol": symbol, "ok": False, "error": "empty response from Dhan"}
+        row = _get_nse_indices().get(nse_name, {})
+        if not row:
+            return {"symbol": symbol, "ok": False, "error": f"'{nse_name}' not found in allIndices"}
 
-        last = float(d.get("last_price", 0))
-        ohlc = d.get("ohlc", {}) or {}
-        prev_close = float(ohlc.get("close") or d.get("close_price") or last)
-        pct_change = round(100 * (last - prev_close) / prev_close, 2) if prev_close else 0
+        last = float(row.get("last", 0))
+        pct_change = float(row.get("percentChange", 0))
+
+        # day low/high: try Dhan's quote for these (separate from the
+        # change calc, which NSE already gives us correctly)
+        day_low, day_high = last, last
+        try:
+            sec_id = DHAN_SEC_IDS[symbol]
+            data = _dhan_quote({"IDX_I": [sec_id]})
+            d = data.get("data", {}).get("IDX_I", {}).get(str(sec_id), {})
+            ohlc = d.get("ohlc", {}) or {}
+            day_low = float(ohlc.get("low") or last)
+            day_high = float(ohlc.get("high") or last)
+        except Exception:
+            pass  # non-critical, fall back to last price for both
+
         return {
             "symbol": symbol,
             "last": last,
             "pct_change": pct_change,
-            "day_low": float(ohlc.get("low") or last),
-            "day_high": float(ohlc.get("high") or last),
+            "day_low": day_low,
+            "day_high": day_high,
             "ok": True,
         }
     except Exception as e:
@@ -184,14 +202,14 @@ def get_index_snapshot(symbol="NIFTY"):
 
 def get_india_vix():
     try:
-        d = _get_indices_quote().get("VIX", {})
-        if not d:
-            return {"ok": False, "error": "empty response from Dhan"}
-        last = float(d.get("last_price", 0))
-        ohlc = d.get("ohlc", {}) or {}
-        prev_close = float(ohlc.get("close") or d.get("close_price") or last)
-        pct_change = round(100 * (last - prev_close) / prev_close, 2) if prev_close else 0
-        return {"last": round(last, 2), "pct_change": pct_change, "ok": True}
+        row = _get_nse_indices().get("INDIA VIX", {})
+        if not row:
+            return {"ok": False, "error": "'INDIA VIX' not found in allIndices"}
+        return {
+            "last": float(row.get("last", 0)),
+            "pct_change": float(row.get("percentChange", 0)),
+            "ok": True,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -367,4 +385,3 @@ def build_dashboard_data():
         "fii": get_fii_positioning(),
         "global": get_global_markets(),
     }
-  
