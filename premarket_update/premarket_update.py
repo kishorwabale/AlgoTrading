@@ -4,7 +4,7 @@ Telegram message. Meant to run once each trading morning, 8:45-9:00 AM IST,
 before market open.
 
 ENV VARS REQUIRED (reuse the same bot you already use for OC Radar alerts):
-  TELEGRAM_BOT_TOKEN   - your bot token from @BotFather
+  TELEGRAM_TOKEN       - your bot token from @BotFather
   TELEGRAM_CHAT_ID     - the chat/channel id to post into
 
 Run manually:
@@ -82,24 +82,22 @@ def build_message():
     if d["global"].get("ok"):
         g = d["global"]["groups"]
         lines.append("")
-        lines.append("*US:* " + "  ".join(
-            f"{k} {fmt_pct(v.get('pct_change'))}" for k, v in g["us"].items() if v.get("ok")
-        ))
-        lines.append("*Commodities:* " + "  ".join(
-            f"{k} {fmt_pct(v.get('pct_change'))}" for k, v in g["commodities"].items() if v.get("ok")
-        ))
-        lines.append("*Asia:* " + "  ".join(
-            f"{k} {fmt_pct(v.get('pct_change'))}" for k, v in g["asia"].items() if v.get("ok")
-        ))
+        for group_key, group_label in [("us", "US"), ("commodities", "Commodities"), ("asia", "Asia")]:
+            entries = [
+                f"{k} {fmt_pct(v.get('pct_change'))}"
+                for k, v in g[group_key].items() if v.get("ok")
+            ]
+            if entries:
+                lines.append(f"*{group_label}:* " + "  ".join(entries))
 
     return "\n".join(lines)
 
 
 def send_telegram(message):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env vars.")
+        print("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID env vars.")
         sys.exit(1)
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
