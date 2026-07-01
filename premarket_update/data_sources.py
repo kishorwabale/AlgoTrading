@@ -323,13 +323,50 @@ def get_fii_positioning():
 
 
 # ---------------------------------------------------------------------------
-# Gift Nifty - manual entry (see docstring at top)
+# Gift Nifty - NSE's marketStatus endpoint (undocumented but real), with
+# manual-entry fallback since Gift Nifty has no official public API and
+# this endpoint's reliability from CI is untested
 # ---------------------------------------------------------------------------
+def _fetch_gift_nifty_from_nse():
+    """
+    NSE's own marketStatus endpoint carries a 'giftnifty' object alongside
+    market state - not documented, but it's first-party NSE data, not a
+    third-party scrape. Untested from CI so far; may hit the same
+    bot-protection wall as other main-site endpoints.
+    """
+    s = _nse_session()
+    r = s.get("https://www.nseindia.com/api/marketStatus", timeout=5)
+    r.raise_for_status()
+    gn = r.json().get("giftnifty", {})
+    if not gn or "PERCHANGE" not in gn:
+        raise ValueError("giftnifty field missing from marketStatus response")
+    return {
+        "gap_points": gn.get("DAYCHANGE"),
+        "last_price": gn.get("LASTPRICE"),
+        "pct_change": gn.get("PERCHANGE"),
+        "expiry": gn.get("EXPIRYDATE"),
+        "updated": datetime.now().isoformat(),
+        "source": "nse",
+        "ok": True,
+    }
+
+
 def get_gift_nifty():
+    # Try NSE first — falls through to manual entry if blocked/unavailable
+    try:
+        return _fetch_gift_nifty_from_nse()
+    except Exception:
+        pass
+
     try:
         with open(CACHE_FILE) as f:
             data = json.load(f)
-        return {"gap_points": data.get("gap_points"), "updated": data.get("updated"), "ok": True}
+        return {
+            "gap_points": data.get("gap_points"),
+            "updated": data.get("updated"),
+            "source": "manual",
+            "ok": True,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -385,3 +422,4 @@ def build_dashboard_data():
         "fii": get_fii_positioning(),
         "global": get_global_markets(),
     }
+  
