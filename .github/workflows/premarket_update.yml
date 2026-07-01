@@ -1,0 +1,28 @@
+name: Pre-Market Update Bot
+
+on:
+  schedule:
+    # 3:15 UTC = 8:45 AM IST, weekdays only (Mon-Fri)
+    - cron: "15 3 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: ./premarket_update
+
+      - name: Send Telegram report
+        working-directory: ./premarket_update
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python premarket_update.py
