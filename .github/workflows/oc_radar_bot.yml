@@ -1,1 +1,59 @@
+# =============================================================
+# OC RADAR BOT - GitHub Actions Workflow
+# Single job: 9:05 AM - 3:05 PM IST (6 hours exactly)
+# Free forever - no proxy issues!
+# =============================================================
 
+name: OC Radar Bot
+
+on:
+  schedule:
+    # 9:05 AM IST = 3:35 AM UTC (Mon-Fri)
+    - cron: '35 3 * * 1-5'
+  workflow_dispatch:  # Manual trigger anytime
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+concurrency:
+  group: oc-radar-bot
+  cancel-in-progress: true
+
+jobs:
+  run_bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # 5h55m - safely under 6hr GitHub limit
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pytz gspread google-auth
+
+      - name: Create .env file
+        run: |
+          cat > $HOME/.env << ENVEOF
+          TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          DHAN_CLIENT_ID=${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_PIN=${{ secrets.DHAN_PIN }}
+          DHAN_TOTP_SECRET=${{ secrets.DHAN_TOTP_SECRET }}
+          GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS_B64=${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          ENVEOF
+          chmod 600 $HOME/.env
+          echo "Created .env file"
+
+      - name: Verify setup
+        run: |
+          echo "Python: $(python --version)"
+          echo "Bot: $(ls -la oc_radar/oc_radar_bot.py)"
+
+      - name: Run OC Radar Bot
+        run: python oc_radar/oc_radar_bot.py
