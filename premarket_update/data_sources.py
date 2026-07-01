@@ -411,6 +411,112 @@ def get_global_markets():
     return {"ok": any_ok, "groups": out}
 
 
+# ---------------------------------------------------------------------------
+# Nifty futures pre-open (9:00-9:15 auction) — implied gap vs prev close
+# ---------------------------------------------------------------------------
+# UNVERIFIED as of first build: whether Dhan's REST quote endpoint reflects
+# the live-updating indicative price during the 9:00-9:12 auction window,
+# or only settles once it concludes. Needs a live check during actual
+# market hours before trusting this as a real-time pre-open signal.
+_futures_sec_id_cache = {"id": None}
+
+
+def _get_nifty_futures_security_id():
+    """
+    Downloads Dhan's compact instrument master CSV and finds the current
+    front-month NIFTY index futures contract's security ID (this changes
+    every monthly expiry, so it can't be hardcoded). Column names are
+    best-effort based on Dhan's documented CSV format; if nothing matches,
+    the error includes the actual column names seen so it's fixable fast.
+    """
+    if _futures_sec_id_cache["id"]:
+        return _futures_sec_id_cache["id"]
+
+    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    reader = csv.DictReader(io.StringIO(r.text))
+    rows = list(reader)
+    if not rows:
+        raise ValueError("instrument master CSV came back empty")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    candidates = []
+    for row in rows:
+        instrument = (row.get("SEM_INSTRUMENT_NAME") or row.get("INSTRUMENT") or "").upper()
+        symbol = (
+            row.get("SEM_TRADING_SYMBOL")
+            or row.get("SEM_CUSTOM_SYMBOL")
+            or row.get("SYMBOL_NAME")
+            or ""
+        ).upper()
+        expiry = row.get("SEM_EXPIRY_DATE") or row.get("EXPIRY_DATE") or ""
+        sec_id = row.get("SEM_SMST_SECURITY_ID") or row.get("SECURITY_ID")
+        if (
+            instrument == "FUTIDX"
+            and "NIFTY" in symbol
+            and "BANK" not in symbol
+            and "FIN" not in symbol
+            and expiry >= today
+            and sec_id
+        ):
+            candidates.append((expiry, sec_id))
+
+    if not candidates:
+        raise ValueError(f"no NIFTY FUTIDX row matched. CSV columns were: {list(rows[0].keys())}")
+
+    candidates.sort()
+    _futures_sec_id_cache["id"] = candidates[0][1]
+    return candidates[0][1]
+
+
+def get_futures_preopen():
+    """
+    Nifty near-month futures price, meant to be checked during/after the
+    9:00-9:15 pre-open auction. Compares against NIFTY 50's previous close
+    (from NSE allIndices) to get an implied gap — same idea as Gift Nifty,
+    but from the domestic pre-open auction rather than the overnight NSE IX
+    contract.
+    """
+    try:
+        sec_id = _get_nifty_futures_security_id()
+        token = _get_dhan_token()
+        headers = {
+            "access-token": token,
+            "client-id": DHAN_CLIENT_ID,
+            "Content-Type": "application/json",
+        }
+        r = requests.post(
+            "https://api.dhan.co/v2/marketfeed/quote",
+            headers=headers,
+            json={"NSE_FNO": [int(sec_id)]},
+            timeout=10,
+        )
+        r.raise_for_status()
+        d = r.json().get("data", {}).get("NSE_FNO", {}).get(str(sec_id), {})
+        if not d:
+            return {"ok": False, "error": "empty response from Dhan for futures contract"}
+        fut_price = float(d.get("last_price", 0))
+        if not fut_price:
+            return {"ok": False, "error": "futures last_price came back as 0"}
+
+        nse_row = _get_nse_indices().get("NIFTY 50", {})
+        prev_close = float(nse_row.get("previousClose", 0) or 0)
+        if not prev_close:
+            return {"ok": False, "error": "couldn't get NIFTY previous close for gap calc"}
+
+        gap = round(fut_price - prev_close, 2)
+        return {
+            "futures_price": fut_price,
+            "prev_close": prev_close,
+            "gap_points": gap,
+            "security_id": sec_id,
+            "ok": True,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def build_dashboard_data():
     """Single entry point the Flask route / Telegram script calls."""
     return {
@@ -419,7 +525,7 @@ def build_dashboard_data():
         "vix": get_india_vix(),
         "pcr": get_pcr("NIFTY"),
         "gift_nifty": get_gift_nifty(),
+        "futures_preopen": get_futures_preopen(),
         "fii": get_fii_positioning(),
         "global": get_global_markets(),
     }
-  
