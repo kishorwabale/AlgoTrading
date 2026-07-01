@@ -31,6 +31,18 @@ def fmt_pct(val):
 
 def build_message():
     d = ds.build_dashboard_data()
+
+    # Debug: print raw error details for any failed source (only shows in
+    # Actions logs, not in the Telegram message itself)
+    for key in ("nifty", "vix", "pcr", "fii"):
+        if not d[key].get("ok"):
+            print(f"DEBUG [{key}] failed: {d[key].get('error')}")
+    if not d["global"].get("ok"):
+        for grp, tickers in d["global"].get("groups", {}).items():
+            for name, row in tickers.items():
+                if not row.get("ok"):
+                    print(f"DEBUG [global.{grp}.{name}] failed: {row.get('error')}")
+
     lines = []
     lines.append("📊 <b>PRE-MARKET RADAR</b>")
     lines.append(f"<i>{d['generated_at']}</i>")
@@ -117,4 +129,3 @@ if __name__ == "__main__":
     msg = build_message()
     print(msg)  # useful for debugging in GitHub Actions logs
     send_telegram(msg)
-  
