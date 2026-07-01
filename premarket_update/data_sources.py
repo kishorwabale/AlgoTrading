@@ -525,7 +525,6 @@ def build_dashboard_data():
         "vix": get_india_vix(),
         "pcr": get_pcr("NIFTY"),
         "gift_nifty": get_gift_nifty(),
-        "futures_preopen": get_futures_preopen(),
         "fii": get_fii_positioning(),
         "global": get_global_markets(),
     }
