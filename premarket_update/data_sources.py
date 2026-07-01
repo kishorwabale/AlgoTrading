@@ -41,11 +41,20 @@ NSE_HEADERS = {
 }
 
 
-def _nse_session():
-    """NSE's API blocks bare requests; you need cookies from a homepage hit first."""
+def _nse_session(referer=None):
+    """
+    NSE blocks bare requests; you need cookies from a homepage hit first.
+    Some endpoints (equity-stockIndices, option-chain-indices) additionally
+    check the Referer header and reject requests that don't look like they
+    came from browsing the matching page on nseindia.com - so we optionally
+    warm up on that specific page too.
+    """
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
     s.get("https://www.nseindia.com", timeout=5)
+    if referer:
+        s.headers.update({"Referer": referer})
+        s.get(referer, timeout=5)
     return s
 
 
@@ -59,7 +68,7 @@ def get_index_snapshot(symbol="NIFTY"):
     OC Radar's option chain fetch, just on the index instead of the chain).
     """
     try:
-        s = _nse_session()
+        s = _nse_session(referer="https://www.nseindia.com/market-data/live-equity-market")
         r = s.get(
             f"https://www.nseindia.com/api/equity-stockIndices?index={'NIFTY%2050' if symbol=='NIFTY' else symbol}",
             timeout=5,
@@ -102,7 +111,7 @@ def get_pcr(symbol="NIFTY"):
     you already compute PCR there, just import/reuse it.
     """
     try:
-        s = _nse_session()
+        s = _nse_session(referer=f"https://www.nseindia.com/option-chain")
         r = s.get(
             f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
             timeout=5,
@@ -208,37 +217,55 @@ def set_gift_nifty(gap_points):
 
 
 # ---------------------------------------------------------------------------
-# Global markets - yfinance (no key required)
+# Global markets - Stooq (no auth needed)
 # ---------------------------------------------------------------------------
-GLOBAL_TICKERS = {
-    "us": {"Dow Jones": "^DJI", "S&P 500": "^GSPC", "Nasdaq": "^IXIC"},
-    "commodities": {"Gold": "GC=F", "Brent Oil": "BZ=F", "USD/INR": "USDINR=X"},
-    "asia": {"Nikkei": "^N225", "Hang Seng": "^HSI", "Shanghai": "000001.SS"},
+# NOTE: yfinance was tried first but Yahoo Finance actively rate-limits/blocks
+# requests from cloud datacenter IPs (including GitHub Actions runners) with
+# 429s and broken cookie/crumb auth - this is a widespread, ongoing issue,
+# not something fixable with a version bump. Stooq's plain CSV endpoint has
+# no such auth layer and works reliably from CI runners.
+STOOQ_TICKERS = {
+    "us": {"Dow Jones": "^dji", "S&P 500": "^spx", "Nasdaq": "^ndq"},
+    "commodities": {"Gold": "xauusd", "Brent Oil": "brn.f", "USD/INR": "usdinr"},
+    "asia": {"Nikkei": "^nkx", "Hang Seng": "^hsi", "Shanghai": "^shc"},
 }
 
 
-def get_global_markets():
-    try:
-        import yfinance as yf
-    except ImportError:
-        return {"ok": False, "error": "pip install yfinance --break-system-packages"}
+def _stooq_pct_change(symbol):
+    """Fetch last ~5 sessions of daily closes from Stooq, return latest % change."""
+    import csv
+    import io
 
+    end = datetime.now()
+    start = end - timedelta(days=10)
+    url = (
+        f"https://stooq.com/q/d/l/?s={symbol}&d1={start.strftime('%Y%m%d')}"
+        f"&d2={end.strftime('%Y%m%d')}&i=d"
+    )
+    r = requests.get(url, timeout=5)
+    r.raise_for_status()
+    reader = csv.DictReader(io.StringIO(r.text))
+    rows = [row for row in reader if row.get("Close")]
+    if len(rows) < 2:
+        raise ValueError(f"not enough data for {symbol}")
+    prev_close = float(rows[-2]["Close"])
+    last_close = float(rows[-1]["Close"])
+    return round(100 * (last_close - prev_close) / prev_close, 2)
+
+
+def get_global_markets():
     out = {}
-    for group, tickers in GLOBAL_TICKERS.items():
+    any_ok = False
+    for group, tickers in STOOQ_TICKERS.items():
         out[group] = {}
-        for name, ticker in tickers.items():
+        for name, symbol in tickers.items():
             try:
-                t = yf.Ticker(ticker)
-                hist = t.history(period="2d")
-                if len(hist) >= 2:
-                    prev, last = hist["Close"].iloc[-2], hist["Close"].iloc[-1]
-                    pct = round(100 * (last - prev) / prev, 2)
-                else:
-                    pct = None
-                out[group][name] = {"pct_change": pct, "ok": pct is not None}
+                pct = _stooq_pct_change(symbol)
+                out[group][name] = {"pct_change": pct, "ok": True}
+                any_ok = True
             except Exception as e:
                 out[group][name] = {"ok": False, "error": str(e)}
-    return {"ok": True, "groups": out}
+    return {"ok": any_ok, "groups": out}
 
 
 def build_dashboard_data():
@@ -251,5 +278,5 @@ def build_dashboard_data():
         "gift_nifty": get_gift_nifty(),
         "fii": get_fii_positioning(),
         "global": get_global_markets(),
-    }
+  }
   
