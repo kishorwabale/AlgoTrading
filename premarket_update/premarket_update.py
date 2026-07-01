@@ -34,7 +34,7 @@ def build_message():
 
     # Debug: print raw error details for any failed source (only shows in
     # Actions logs, not in the Telegram message itself)
-    for key in ("nifty", "vix", "pcr", "fii"):
+    for key in ("nifty", "vix", "pcr", "fii", "gift_nifty"):
         if not d[key].get("ok"):
             print(f"DEBUG [{key}] failed: {d[key].get('error')}")
     if not d["global"].get("ok"):
@@ -75,10 +75,11 @@ def build_message():
 
     # Gift Nifty
     g = d["gift_nifty"]
-    if g.get("ok"):
+    if g.get("ok") and g.get("gap_points") is not None:
         gap = g["gap_points"]
         sign = "+" if gap >= 0 else ""
-        lines.append(f"<b>Gift Nifty Gap:</b> {sign}{gap} pts")
+        tag = " (auto)" if g.get("source") == "nse" else " (manual)"
+        lines.append(f"<b>Gift Nifty Gap:</b> {sign}{gap} pts{tag}")
     else:
         lines.append("<b>Gift Nifty Gap:</b> not set - update gift_nifty.json")
 
@@ -129,3 +130,4 @@ if __name__ == "__main__":
     msg = build_message()
     print(msg)  # useful for debugging in GitHub Actions logs
     send_telegram(msg)
+  
